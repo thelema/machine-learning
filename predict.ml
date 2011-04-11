@@ -1,113 +1,300 @@
 open Batteries_uni
 open Printf
 
-open Bigarray
-open Lacaml.Impl.D
+open Libosvm
+open Lacaml.Impl.S (* Single-precision reals *)
 
+
+let print_float oc x = fprintf oc "%.3f" x
+let print_float5 oc x = fprintf oc "%.5f" x
+
+let real_run = Array.length Sys.argv > 1
 let debug = false
-let rows = 125000
-let cols = 900
-
-let cats = 2
+let cat_bits = ref 10
+let category_count = 146
 let top_n = 100
+let loops = 10
 
-let pred w x = let p = dot ~x w in abs_float p, p>0.
+let train_file = "training.ba"
+let train_label_file = "training_label.txt"
+let test_file = if real_run then Sys.argv.(1) else "development.ba"
+let test_label_file = "development_label.txt"
+
+
+module type Private_int = sig type t val of_int : int -> t val to_int : t -> int val print : 'a IO.output -> t -> unit val compare : t -> t -> int end
+module Bit_cat : Private_int = Int
+module Cat : Private_int = Int
+
+let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
+
 let right = ref 0
 let count = ref 0
 
-let perceptron () =
-  let w = Vec.make0 cols in
-  let wsum = Vec.make0 cols in
-  let learn (xi, yi) =
-    let _,pred = pred w xi in
-    if pred <> yi then 
-      if yi 
-      then (if debug then printf "+%!"; ignore(Vec.add ~n:cols ~z:w xi w))
-      else (if debug then printf "-%!"; ignore(Vec.sub ~n:cols ~z:w xi w))
-    else incr right;
+let perceptron acc =
+  let w = Vec.make0 Datafile.cols in
+  fun xi yi -> 
+    if debug then printf "XI(%d):\n%a\n%!" !count (Array.print print_float) (Vec.to_array xi);
+    if dot xi w *. yi < 0. then axpy ~alpha:yi ~x:xi w else incr right;
     incr count;
-    ignore(Vec.add ~n:cols ~z:wsum wsum w);
+    ignore(Vec.add ~z:acc acc w);
+    let n2 = Vec.sqr_nrm2 w in
+(*    if !count land 0xff = 0 then printf "i:%d D:%.2f, dec:%B really:%B wnorm:%.2f\n" !count d y yi n2; *)
+    if n2 > 1000. then (printf "s"; scal (500. /. n2) w;)
+
+let per2 data labels =
+  count := 0; right := 0;
+  let accum w (xi,yi) =
+    incr count;
+    if dot xi w *. yi > 0. then (incr right; w)
+    else if yi > 0. then Vec.add w xi else Vec.sub w xi
   in
-  (learn, fun () -> scal (1. /. float !count) wsum; wsum)
+  let n = Array.length data in
+  let data_label = (0--^n) |> map (fun i -> data.(i), labels.(i)) in
+  let ws = Enum.scanl accum (Vec.make0 Datafile.cols) data_label in
+  let wsum = Vec.make0 Datafile.cols in
+  Enum.iter (fun wi -> ignore(Vec.add ~z:wsum wsum wi)) ws;
+  scal (1. /. float n) wsum;
+  (fun x -> dot x wsum)
 
-let to_vec l = List.map float_of_string l |> Vec.of_list
 
-(*
-let read_data_line line = String.nsplit line " " |> to_vec
-let read_data_file fn = File.lines_of fn /@ read_data_line *)
+let kp_core n kij labels ais =
+  let rec sum i acc j = 
+    if j >= n then acc 
+    else sum i (ais.(j) *. kij.(i).(j) +. acc) (j+1) 
+  in
+  Array.iteri (fun i yi -> if yi *. (sum i 0. 0) <= 0. then ais.(i) <- ais.(i) +. yi) labels
+
+let kperceptron k data labels =
+  let n = Array.length data in
+  let ais = Array.create n 0. in
+  let kij = Array.make_matrix n n 0. in
+  Array.iteri (fun i xi -> Array.iteri (fun j xj -> kij.(i).(j) <- k xi xj) data) data;
+  for l = 1 to loops do kp_core n kij labels ais done;
+  (fun x -> let t = ref 0. in for i = 0 to n-1 do t := !t +. ais.(i) *. k x data.(i); done; abs_float !t, (if !t = 0. then Random.bool () else !t > 0.))
+
+let k_2 x1 x2 = let a = (1. +. dot x1 x2) in a *. a
+let k_3 x1 x2 = let a = (1. +. dot x1 x2) in a *. a *. a
+let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
+
+let mask = (1 lsl !cat_bits) - 1
+
+type ('a,'b) manual_cache = {
+  get : 'a -> 'b; 
+  del : 'a -> unit; 
+  enum: unit -> ('a * 'b) BatEnum.t
+}
+
+let make_map ~gen =
+  let m = ref BatMap.empty in
+  {get = (fun k -> 
+    try BatMap.find k !m
+    with Not_found -> gen k |> tap (fun v -> m := BatMap.add k v !m));
+   del = (fun k -> m := BatMap.remove k !m);
+   enum = (fun () -> BatMap.enum !m) }
 
 
-let read_data_file fn = 
-  let fh = Unix.openfile fn [Unix.O_RDONLY] 0o755 in
-  let mmap = Array2.map_file fh int8_signed fortran_layout false cols rows in
-  let get_row i = Array2.slice_right mmap i |> Array1.map float float64 in
-  (1--rows) |> Enum.map get_row
-    
+let {get = map_cat; enum=cat_mapping} = 
+  make_map (fun _ -> Bit_cat.of_int (Random.bits () land mask))
 
-let read_label_file fn = File.lines_of fn /@ int_of_string /@ (fun y -> y land 1 = 0)
+let read_label_file fn = File.lines_of fn /@ int_of_string /@ Cat.of_int
 
 let read_data data label = 
-  Enum.combine (read_data_file data, read_label_file label)
+  Enum.combine (Datafile.read data, read_label_file label)
 
-let rec insert x = function
-  | [] -> [x]
-  | y::ys when y < x -> y::(insert x ys)
-  | ys -> x::ys;;
-
-let top n xs =
-  let rec loop1 acc xs = function
-    | 0 -> (acc, xs)
-    | n -> loop1 (insert (List.hd xs) acc) (List.tl xs) (n - 1)
-  in
-  let rec loop2 acc = function
-    | [] -> List.rev acc
-    | x::xs -> loop2 (List.tl (insert x acc)) xs
-  in
-  let (acc, xs) = loop1 [] xs n in
-  loop2 acc xs;;
-
-let push (k,v) (map,min_k,count as _acc) = 
+let push ((k:float),v) (map,min_k,count as _acc) = 
   if count < top_n then 
     (Map.add k v map, min k min_k, count+1) 
 (*  else if k < min_k then acc *)
   else 
-    let m = Map.add k v map |> Map.remove min_k in 
+    let m = Map.remove min_k map |> Map.add k v in 
     (m, Map.min_binding m |> fst, count)
 
-let test w acc (x, y) = 
-  let str, pred = pred w x in 
-  Map.modify_def (Map.create Float.compare, 0.,0) y (push (str, pred)) acc
+let rec popcount c x = if x = 0 then c else popcount (c+1) (x land (x-1))
+let ham_dist x y = popcount 0 (x lxor Bit_cat.to_int y) (*|> tap (fun d -> printf "HD(%x,%x) = %d " x (Bit_cat.to_int y) d) *)
 
-let score_map y items = 
-  let add_points pts pred acc = if pred = y then acc + pts else acc in
-  let points = Enum.fold2 add_points 0 (top_n --- 1) (List.enum items) in
-  float points /. float top_n
+let nearest_in label_map (pred_strength,pred_lab) = 
+  let orig_lab,_ = 
+    Enum.arg_min (fun (_,bit_lab) -> ham_dist pred_lab bit_lab) (Array.enum label_map) 
+  in 
+  pred_strength,orig_lab
 
-let train_file = "development.ba"
-let train_label_file = "development_label.txt"
-let test_file = "development.ba"
-let test_label_file = "development_label.txt"
+let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :: (to_bits (n-1) (x asr 1))
+let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
 
-let () = 
-  let data = read_data train_file train_label_file in
-  let lrn, ret = perceptron () in
-  printf "Training..%!";
+type 'a pred_f_t = vec -> float * 'a
+
+let extend_hamm_incr incr_learner data =
+  let ws = List.init !cat_bits (fun _ -> Vec.make0 Datafile.cols) in
+  let ps = List.map incr_learner ws in
+  let lrn_data () = 
+    Enum.iter (fun (xi,yi) -> 
+      let bits = to_bits !cat_bits (map_cat yi |> Bit_cat.to_int) in
+      List.iter2 (fun p b -> p xi b) ps bits) (data ())
+  in
+  printf "Training hamm..\n%!";
   let t0 = Sys.time() in
-  Enum.iter lrn data;
+  for i = 1 to loops do
+    let err_in = !count - !right in
+    lrn_data ();
+    printf "Loop: %d, err: %d, nrm2s: %a\n%!" i (!count - !right - err_in) (List.print print_float5) (List.map (fun w -> Vec.sqr_nrm2 w /. float !count /. float !count) ws); 
+    
+  done;
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
   printf "Correct during training: %d of %d\n" !right !count;
-  let w = ret() in
-(*  Vec.to_array w |> Array.print Float.print stdout; print_newline ();*)
-  let data = read_data train_file train_label_file in
+  let scal_f = 1. /. float !count in
+  List.iter (fun w -> scal scal_f w) ws;
+  let cat_map = cat_mapping () |> Array.of_enum in
+  printf "CatMap: %a\n" (Array.print (Pair.print Cat.print Bit_cat.print)) cat_map;
+  let pred_n x = 
+    List.rev_map (fun w -> dot w x) ws 
+    |> List.fold_left merge_qb (1.,0) 
+    |> nearest_in cat_map 
+  in
+  (pred_n : Cat.t pred_f_t)
+
+let extend_hamm gen_classifier data labels =
+  let mask = (1 lsl !cat_bits) - 1 in
+  let {get = map_cat; enum=cat_mapping} = 
+    make_map (fun _ -> Random.bits () land mask) in
+  let gen_labels i = Array.map (fun l -> if ((map_cat l) asr i) land 1 = 1 then 1. else -1.) labels in
+  let classifiers = List.init !cat_bits (fun i -> gen_classifier data (gen_labels i)) in
+  let cat_map = cat_mapping () |> Enum.map (second Bit_cat.of_int) |> Array.of_enum in
+  let pred_n x = 
+    List.rev_map (fun classifier -> classifier x) classifiers
+    |> List.fold_left merge_qb (1.,0) 
+    |> nearest_in cat_map 
+  in
+  (pred_n : Cat.t pred_f_t)
+
+
+let extend_one_one_incr incr_learner data_f =
+  right := 0; count := 0;
+  printf "Training 1-1..\n%!";
   let t0 = Sys.time() in
-  let predict_maps = Enum.fold (test w) Map.empty data in
-  let top_n_map = Map.map (fun (m,_,_) -> Map.enum m |> map snd |> List.of_backwards) predict_maps in
-  let scores = Map.mapi score_map top_n_map in
-  printf "Scores: %a (%.2fs)\n" (Map.print Bool.print Float.print) scores (Sys.time () -. t0);
+  let mm = Enum.fold (fun acc (x,y) -> Map.modify_def [] (Cat.to_int y) (List.cons x) acc) (Map.create Int.compare) (data_f ()) in
+  let pairs = Map.keys mm |> map (fun i -> Map.keys mm // (fun x -> x > i) /@ (fun j -> i,j)) |> Enum.flatten |> List.of_enum in
+  let idata i y = try Map.find i mm |> List.enum |> Enum.map (fun x -> (x,y)) with Not_found -> failwith ("No values of category " ^ string_of_int i) in
+  let train_p (i,j) = 
+    let err_in = !count - !right in
+    let ws = Vec.make0 Datafile.cols in
+    let pc_learn = incr_learner ws in
+    Enum.append (idata i 1.) (idata j (-1.)) 
+    |> Random.shuffle |> Array.enum
+    |> iter (fun (i,j) -> pc_learn i j);
+    printf "1-1: (%d,%d), err: %d, nrm2s: %a\n%!" i j (!count - !right - err_in) print_float5 (Vec.sqr_nrm2 ws /. float (!count * !count)); 
+    ws
+  in
+  let ws = List.map train_p pairs in
+  printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
+  printf "Correct during training: %d of %d\n" !right !count;
+  let max_cat = Enum.reduce max (Map.keys mm) in
+  let cat_count = Map.keys mm |> Enum.count in
+  let pred_n x =
+    let votes = Array.create (max_cat+1) 0 in
+    let pc_vote (i,j) w = 
+      let vote = if dot w x > 0. then i else j in
+      votes.(vote) <- votes.(vote) + 1
+    in
+    List.iter2 pc_vote pairs ws;
+    let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
+    float votes.(winner) /. float cat_count, Cat.of_int winner
+  in
+  (pred_n: Cat.t pred_f_t)
+
+let extend_one_one gen_classifier data_f =
+(*  let mm = ref (Map.create Int.compare) in
+  let add_mm (x,y) = mm := Map.modify_def [] y (List.cons x) !mm in
+  iter add_mm (data_f ());*)
+  right := 0; count := 0;
+  printf "Training 1-1..\n%!";
+  let t0 = Sys.time() in
+  let mm = Enum.fold (fun acc (x,y) -> Map.modify_def [] (Cat.to_int y) (List.cons x) acc) (Map.create Int.compare) (data_f ()) in
+  let pairs = Map.keys mm |> map (fun i -> Map.keys mm // (fun x -> x > i) /@ (fun j -> i,j)) |> Enum.flatten |> List.of_enum in
+  let idata i y = try Map.find i mm |> List.enum |> Enum.map (fun x -> (x,y)) with Not_found -> failwith ("No values of category " ^ string_of_int i) in
+  let train_p (i,j) = 
+    let err_in = !count - !right in
+    let ws = Vec.make0 Datafile.cols in
+    let pc_learn = gen_classifier ws in
+    Enum.append (idata i true) (idata j false) 
+    |> Random.shuffle |> Array.enum
+    |> iter (fun (i,j) -> pc_learn i j);
+    printf "1-1: (%d,%d), err: %d, nrm2s: %a\n%!" i j (!count - !right - err_in) print_float5 (Vec.sqr_nrm2 ws /. float (!count * !count)); 
+    ws
+  in
+  let ws = List.map train_p pairs in
+  printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
+  printf "Correct during training: %d of %d\n" !right !count;
+  let max_cat = Enum.reduce max (Map.keys mm) in
+  let cat_count = Map.keys mm |> Enum.count in
+  let pred_n x =
+    let votes = Array.create (max_cat+1) 0 in
+    let pc_vote (i,j) w = 
+      let vote = if dot w x > 0. then i else j in
+      votes.(vote) <- votes.(vote) + 1
+    in
+    List.iter2 pc_vote pairs ws;
+    let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
+    float votes.(winner) /. float cat_count, Cat.of_int winner
+  in
+  (pred_n: Cat.t pred_f_t)
+
+let score_map pred items = 
+  let len = List.length items in
+  let add_points pts (i,y) acc = if pred = y then acc + pts else acc in
+  let points = Enum.fold2 add_points 0 (len --- 1) (List.enum items) in
+  float points /. float len
+
+let score_map is_correct guess_cat guess_ids = 
+  let correct_enum = Enum.map (is_correct guess_cat) (List.enum guess_ids) in
+  let is_correct _ = match Enum.get correct_enum with Some true -> true | _ -> false in
+  let points = Enum.filter is_correct (top_n --- 1) |> Enum.fold (+) 0 in
+  float points /. float top_n
+
+let push_pred i (str, pred) acc = 
+  Map.modify_def (Map.create Float.compare, 0.,0) pred (push (str, i)) acc
+
+let best_predictions preds = 
+  let to_list (m,_,_) = 
+    (* highest to lowest prediction strength *)
+    Map.enum m |> Enum.map snd |> List.of_backwards 
+  in
+  Enum.foldi push_pred Map.empty preds |> Map.map to_list
+
+let gen_predictions pred_gen =
+  let predictor = pred_gen (fun () -> read_data train_file train_label_file) in
+  Enum.map predictor (Datafile.read test_file)
+
+let test_pred pred_gen = 
+  let predictions = gen_predictions pred_gen in
+  let t0 = Sys.time() in
+  let best = best_predictions predictions in
+  printf "Predictions:\n%a\n" (Map.print Cat.print (List.print Int.print)) best;
+  let labels = read_label_file test_label_file |> Array.of_enum in
+  let is_correct guess i = try labels.(i-1) = guess with Invalid_argument _ -> printf "Item %d out of range\n" i; false in
+  let scores = Map.mapi (score_map is_correct) best in
+  printf "Scores: %a (%.2fs)\n" (Map.print ~sep:", " Cat.print print_float) scores (Sys.time () -. t0);
   let overall = Map.enum scores |> map snd |> Enum.reduce (+.) in
-  printf "Overall: %.2f\n" (overall /. float cats) ;
+  printf "Overall: %.2f\n" (overall /. float category_count) ;
   ()
 
+let output_preds ps =
+  let print_pred oc (i,ps) = 
+    List.iter (fun p -> fprintf oc "%d\t%d\n" i p) ps
+  in
+  Enum.print ~first:"" ~last:"" ~sep:"" print_pred stdout (Map.enum ps)
+
+let () = 
+(*  check_data (); *)
+  let perc_hamm = extend_hamm_incr perceptron in
+  let perc_oneone = extend_one_one_incr perceptron in
+  if real_run then
+      gen_predictions (fun _ -> assert false)
+      |> best_predictions
+      |> output_preds
+  else (
+    test_pred perc_hamm;
+    test_pred perc_oneone;
+  )
 
 (*
 let () = printf "Reading..%!"
