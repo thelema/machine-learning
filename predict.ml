@@ -21,16 +21,26 @@ let category_count = 146
 let top_n = 10
 let loops = 10
 
-let train_file = "training.ba"
-let train_label_file = "training_label.txt"
-let test_file = if real_run then Sys.argv.(1) else "development.ba"
-let test_label_file = "development_label.txt"
+let train_data = Datafile.get_matrix "training.ba"
+let train_labels = Datafile.read_label_file "training_label.txt"
+
+let test_data = Datafile.get_matrix (if real_run then Sys.argv.(1) else "development.ba")
+let test_labels = Datafile.read_label_file "development_label.txt"
 
 let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
 
 let norm ais = Vec.sqr_nrm2 ais |> sqrt
 let zeros ais = (1--Array1.dim ais) |> Enum.fold (fun acc i -> if ais.{i} = 0. then acc+1 else acc) 0
 let get_i m i = Array2.slice_right m i
+
+type bpredictor = 
+  | Dot of float array (* weights of different features *)
+  | Kern_3 of int * int * float array (* offset/len of data used, ais*)
+  | Kern_rbf of float * int * int * float array (* sigma, offset/len of data used, ais*)
+  | Svm of string (* filename with serialized predictor *)
+
+type cpredictor = 
+  | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
 
 (********************************************)
 (** Two-category learners *******************)
@@ -53,8 +63,7 @@ let perceptron (data: matrix) (labels: vec) =
   done;
   count := !count + n;
   scal (1. /. float n) acc;
-  (fun x -> dot x acc)
-
+  Dot (Array1.to_array acc)
 
 let kp_core n (kij: matrix) (labels: vec) (ais: vec) =
   let rec sum i acc j = 
@@ -67,32 +76,50 @@ let kp_core n (kij: matrix) (labels: vec) (ais: vec) =
       ais.{i} <- ais.{i} +. yi
   done
  
-let kperceptron k (data: matrix) (labels:vec) =
+let kperceptron kij (labels:vec) =
   let n = Array1.dim labels in
   let ais = Vec.make0 n in
+  printf "\nLooping through %d training data items %d times...%!" n (10*loops);
+  for l = 1 to 10 * loops do kp_core n kij labels ais done;
+  printf "Done. (ai_norm,zeros = %.2f,%d)\n%!" (norm ais) (zeros ais);
+  ais
+
+let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
+let gen_kij_rbf two_sig_sq data =
+  let n = Array2.dim2 data in
   let kij = Array2.create float32 fortran_layout n n in
   printf "Generating kij...%!";
   for i = 1 to n do
     let xi = (Array2.slice_right data i) in
     for j = 1 to n do
-      kij.{i,j} <- k xi (Array2.slice_right data j)
+      kij.{i,j} <- k_rbf two_sig_sq xi (Array2.slice_right data j)
     done;
   done;
-  printf "\nLooping through %d training data items %d times...%!" n (10*loops);
-  for l = 1 to 10 * loops do kp_core n kij labels ais done;
-  printf "Done. (ai_norm,zeros = %.2f,%d)\n%!" (norm ais) (zeros ais);
-  let categorize x = 
-    let t = ref 0. in 
-    for i = 1 to n do 
-      t := !t +. ais.{i} *. k x (Array2.slice_right data i); 
-    done; 
-    !t +. 0.
-  in
-  (fun d -> (1--Array2.dim2 d) |> Enum.map (fun i -> categorize (get_i d i)))
+  kij
 
-let k_2 x1 x2 = let a = (1. +. dot x1 x2) in a *. a
 let k_3 x1 x2 = let a = (1. +. dot x1 x2) in a *. a *. a
-let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
+let gen_kij_3 data =
+  let n = Array2.dim2 data in
+  let kij = Array2.create float32 fortran_layout n n in
+  printf "Generating kij...%!";
+  for i = 1 to n do
+    let xi = (Array2.slice_right data i) in
+    for j = 1 to n do
+      kij.{i,j} <- k_3 xi (Array2.slice_right data j)
+    done;
+  done;
+  kij
+
+
+let kperceptron3_slice off len labels_arr =
+  let kij = gen_kij_3 (Array2.sub_right train_data off len) in
+  let tag a = Kern_3 (off, len, Array1.to_array a) in
+  Array.map (kperceptron kij |- tag) labels_arr
+
+let kperceptron_rbf_slice sigma off len labels_arr =
+  let kij = gen_kij_rbf sigma (Array2.sub_right train_data off len) in
+  let tag a = Kern_rbf (sigma, off, len, Array1.to_array a) in
+  Array.map (kperceptron kij |- tag) labels_arr
 
 (*
 let () = printf "Reading..%!"
@@ -105,6 +132,34 @@ let () = printf "Done(%.2f)\n%!" (Sys.time () -. t0)
 let svm (data: matrix64) (labels: vec) = 
   let _model = svm_train ~svm_type:C_SVC ~kernel_type:RBF data (* labels *) in
   assert false
+
+(** PREDICTION USING A BPREDICTOR **)
+
+let predict_many d f = 
+  (1--Array2.dim2 d) |> Enum.map (fun i -> f (get_i d i))
+
+let predict_b = 
+  function
+  | Dot warr -> let w = Array1.of_array Datafile.kind Datafile.layout warr in (fun x -> dot w x)
+  | Kern_3 (off, len, ais) ->
+    let data = Array2.sub_right train_data off len in
+    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
+    (fun x -> 
+      let t = ref 0. in 
+      for i = 1 to len do 
+	t := !t +. ais.{i} *. k_3 x (Array2.slice_right data i); 
+      done; 
+      !t +. 0.)
+  | Kern_rbf (sigma, off, len, ais) -> 
+    let data = Array2.sub_right train_data off len in
+    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
+    (fun x -> 
+      let t = ref 0. in 
+      for i = 1 to len do 
+	t := !t +. ais.{i} *. k_rbf sigma x (Array2.slice_right data i); 
+      done; 
+      !t +. 0.)
+  | Svm _fn -> assert false
 
 (********************************************)
 (** EXTENDING 2-category to multi-category **)
@@ -138,41 +193,54 @@ let rec popcount c x = if x = 0 then c else popcount (c+1) (x land (x-1))
 let ham_dist x y = popcount 0 (x lxor y) (*|> tap (fun d -> printf "HD(%x,%x) = %d " x (Bit_cat.to_int y) d) *)
 
 let nearest_in label_map pred_lab = 
-    Enum.arg_min (fun (_,bit_lab) -> ham_dist pred_lab bit_lab) (Array.enum label_map) |> fst
+    (Array.range label_map) |> Enum.arg_min (fun i -> ham_dist pred_lab label_map.(i))
 
 let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :: (to_bits (n-1) (x asr 1))
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
 
-let get_heads enum_l = List.fold_left (fun acc x -> match Enum.get x with None -> raise Enum.No_more_elements | Some v -> v :: acc) [] enum_l
-
 let train_t = Time.create "train"
 let eh_pred_p = Point.create "eh_pred"
 
-let extend_hamm gen_classifier (data: matrix) (labels: cats) =
+let extend_hamm gen_classifier =
   Time.start train_t;
-  let n = Array1.dim labels in
+  let n = Array1.dim train_labels in
   let mask = (1 lsl !cat_bits) - 1 in
   let {get = map_cat; enum=cat_mapping} = 
     make_map (fun _ -> Random.bits () land mask) in
   let bit_labels i x = if ((map_cat x) asr i) land 1 = 1 then 1. else -1. in
-  let int_labels = Vec.make0 n in
-  let gen_labels i = for j = 1 to n do int_labels.{j} <- bit_labels i labels.{j} done in
-  printf "Training Classifiers...\n%!";
-  let classifiers = List.init !cat_bits (fun i -> gen_labels i; gen_classifier data int_labels) in
-  printf "Done training\n%!";
-  let cat_map = cat_mapping () |> Array.of_enum in
-  let decode_arr = Array.init (1 lsl !cat_bits) (fun i -> nearest_in cat_map i) in
-  Time.stop train_t;
-  let pred_n xs = 
-    Point.observe eh_pred_p;
-    let decisions = List.rev_map (fun classifier -> classifier xs) classifiers in
-    let decode l = 
-      let (str, bits) = List.fold_left merge_qb (1.,0) l in
-      str, decode_arr.(bits)
-    in
-    Enum.from (fun () -> get_heads decisions) |> Enum.map decode
+  let gen_labels i = 
+    let ls = Vec.make0 n in 
+    for j = 1 to n do ls.{j} <- bit_labels i train_labels.{j} done; 
+    ls 
   in
-  pred_n
+  let all_labels = Array.init !cat_bits gen_labels in
+  printf "Training Classifiers...\n%!";
+  let classifiers = gen_classifier all_labels in
+  printf "Done training\n%!";
+  let cat_map = Array.create category_count 0 in
+  Enum.iter (fun (i,b) -> cat_map.(i) <- b) (cat_mapping ());
+  Time.stop train_t;
+  Hamm (classifiers, cat_map)
+
+let get_heads enum_l = 
+  Array.fold_left (fun acc x -> match Enum.get x with 
+      None -> raise Enum.No_more_elements 
+    | Some v -> v :: acc) 
+    [] enum_l
+
+let predict_cat = function
+  | Hamm (classifiers, cat_map) ->
+    let decode_arr = Array.init (1 lsl !cat_bits) (fun i -> nearest_in cat_map i) in
+    let pred_n xs = 
+      Point.observe eh_pred_p;
+      let decisions = Array.map (fun classifier -> predict_many xs (predict_b classifier)) classifiers in
+      let decode l = 
+	let (str, bits) = List.fold_left merge_qb (1.,0) l in
+	str, decode_arr.(bits)
+      in
+      Enum.from (fun () -> get_heads decisions) |> Enum.map decode
+    in
+    pred_n
 
 (* TODO
 let extend_one_one gen_classifier data labels =
@@ -232,28 +300,17 @@ let best_predictions preds =
   let to_list (m,_,_) = Map.enum m |> Enum.map snd |> List.of_backwards in
   Enum.foldi push_pred Map.empty preds |> Map.map to_list
 
-let read_label_file fn = File.lines_of fn /@ int_of_string |> Array.of_enum |> Array1.of_array int8_unsigned Datafile.layout
-
-let train_full pred_gen =
-  pred_gen (Datafile.get_matrix train_file) (read_label_file train_label_file)
+let train_full pred_gen = pred_gen train_data train_labels
     
-let train_slice ?(skip=0) n pred_gen =
-  let data = Array2.sub_right (Datafile.get_matrix train_file) (skip+1) n in
-  let labels = Array1.sub (read_label_file train_label_file) (skip+1) n in
-  pred_gen data labels
+let train_slice ?(skip=0) n pred_gen = pred_gen skip n
 
 let train_slices n pred_gen =
-  let fulldata = Datafile.get_matrix train_file in
-  let fulllabels = read_label_file train_label_file in
-  let slices = Array1.dim fulllabels / n in
-  let datas = List.init slices (fun i -> Array2.sub_right fulldata (1+n*i) n) in
-  let labels = List.init slices (fun i -> Array1.sub fulllabels (1+n*i) n) in
-  List.map2 pred_gen datas labels
+  let slices = Array1.dim train_labels / n in
+  List.init slices (fun i -> pred_gen (1+n*i) n)
 
 let evaluate best = 
 (*  printf "Predictions:\n%a\n" (Map.print Cat.print (List.print Int.print)) best; *)
-  let labels = read_label_file test_label_file in
-  let is_correct guess i = try labels.{i-1} = guess with Invalid_argument _ -> printf "Item %d out of range\n" i; false in
+  let is_correct guess i = try train_labels.{i+1} = guess with Invalid_argument _ -> printf "Item %d out of range\n" i; false in
   let scores = Map.mapi (score_map is_correct) best in
   printf "Scores: %a\n" (Map.print ~sep:", " Int.print print_float) scores;
   let overall = Map.enum scores |> map snd |> Enum.reduce (+.) in
@@ -265,17 +322,17 @@ let output_preds ps =
   in
   Enum.print ~first:"" ~last:"" ~sep:"" print_pred stdout (Map.enum ps)
 
-let pred_t = Time.create "pred"
-let pred_p = Point.create "pred"
-
-let run_test ?(n = 100_000) ?(print=false) name (pred: int pred_f_t) = 
-  Time.start pred_t; Point.observe pred_p;
-  Datafile.get_matrix test_file 
-  |>  pred 
-  |> best_predictions 
-  |> tap (fun _ -> Time.stop pred_t)
-  |> evaluate |> printf "%s Overall: %.2f\n%!" name
+let run_test ?(n = 100_000) name (pred: int pred_f_t) = 
+  let d = if real_run then test_data else Array2.sub_right test_data 0 n in
+  pred d |> best_predictions |> evaluate |> printf "%s Overall: %.2f\n%!" name
  
+let marshal_file fn_base x =
+  let tm = Unix.time() |> Unix.localtime in
+  let fn = sprintf "%s.%d.%d.%d" fn_base tm.Unix.tm_mday tm.Unix.tm_hour tm.Unix.tm_min in
+  let oc = Pervasives.open_out fn in
+  Legacy.Marshal.to_channel oc x [];
+  Pervasives.close_out oc
+
 (***************************************)
 (**        MAIN        *****************)
 (***************************************)
@@ -283,15 +340,14 @@ let run_test ?(n = 100_000) ?(print=false) name (pred: int pred_f_t) =
 let train () = 
     (*  check_data (); *)
 
-  (extend_hamm (kperceptron k_3) |> train_slice 2000) 
-
-|> 
+  extend_hamm (kperceptron3_slice 0 2000) |> marshal_file "hamm_kp3_2k";
+(*
       run_test ~print:real_run "KP3H";
 
 
   extend_hamm (kperceptron k_3) |> train_slices 1000 |>
       List.iter (run_test ~print:real_run "KP3*" ~n:10000);
-
+*)
 (*
   extend_hamm_incr perceptron |> train_full |>
       run_test ~print:real_run "Hamm";
@@ -305,4 +361,4 @@ let train () =
 let predict () = ()
 
 
-let () = if exe = "train" then train () else predict ()
+let () = if exe = "predict" then predict () else train ()
