@@ -24,6 +24,9 @@ let read fn =
   let get_row i = Array2.slice_right mmap i in
   (1--rows) |> Enum.map get_row
     
+let get_matrix fn =
+  let fh = openfile fn [O_RDONLY] 0o755 in
+  Array2.map_file fh mode layout false cols rows
 
 let write output_file =
   let fh = openfile output_file [O_RDWR;O_CREAT] 0o755 in
