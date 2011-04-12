@@ -31,7 +31,9 @@ let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
 
 let norm ais = Vec.sqr_nrm2 ais |> sqrt
 let zeros ais = (1--Array1.dim ais) |> Enum.fold (fun acc i -> if ais.{i} = 0. then acc+1 else acc) 0
-let get_i m i = Array2.slice_right m i
+let get_i (m:matrix) i = Array2.slice_right m i
+let predict_many d f = (1--Array2.dim2 d) |> Enum.map (fun i -> f (get_i d i))
+
 
 type bpredictor = 
   | Dot of float array (* weights of different features *)
@@ -135,9 +137,6 @@ let svm (data: matrix64) (labels: vec) =
 
 (** PREDICTION USING A BPREDICTOR **)
 
-let predict_many d f = 
-  (1--Array2.dim2 d) |> Enum.map (fun i -> f (get_i d i))
-
 let predict_b = 
   function
   | Dot warr -> let w = Array1.of_array Datafile.kind Datafile.layout warr in (fun x -> dot w x)
@@ -232,9 +231,9 @@ let predict_cat = function
   | Hamm (classifiers, cat_map) ->
     let decode_arr = Array.init (1 lsl !cat_bits) (fun i -> nearest_in cat_map i) in
     let pred_n xs = 
-      Point.observe eh_pred_p;
       let decisions = Array.map (fun classifier -> predict_many xs (predict_b classifier)) classifiers in
       let decode l = 
+	Point.observe eh_pred_p;
 	let (str, bits) = List.fold_left merge_qb (1.,0) l in
 	str, decode_arr.(bits)
       in
@@ -322,13 +321,19 @@ let output_preds ps =
   in
   Enum.print ~first:"" ~last:"" ~sep:"" print_pred stdout (Map.enum ps)
 
-let run_test ?(n = 100_000) name (pred: int pred_f_t) = 
+let run_test ?(n = 100_000) name (cpred: cpredictor) = 
   let d = if real_run then test_data else Array2.sub_right test_data 0 n in
-  pred d |> best_predictions |> evaluate |> printf "%s Overall: %.2f\n%!" name
+  predict_cat cpred d |> best_predictions |> evaluate |> printf "%s Overall: %.2f\n%!" name
  
 let marshal_file fn_base x =
   let tm = Unix.time() |> Unix.localtime in
   let fn = sprintf "%s.%d.%d.%d" fn_base tm.Unix.tm_mday tm.Unix.tm_hour tm.Unix.tm_min in
+  let ctr = ref 0 in
+  let fn = 
+    if Sys.file_exists fn then 
+      ( while Sys.file_exists (fn ^ "." ^ string_of_int !ctr) do incr ctr; done; 
+	(fn ^ "." ^ string_of_int !ctr)) else fn
+  in
   let oc = Pervasives.open_out fn in
   Legacy.Marshal.to_channel oc x [];
   Pervasives.close_out oc
@@ -340,14 +345,9 @@ let marshal_file fn_base x =
 let train () = 
     (*  check_data (); *)
 
-  extend_hamm (kperceptron3_slice 0 2000) |> marshal_file "hamm_kp3_2k";
-(*
-      run_test ~print:real_run "KP3H";
+  kperceptron3_slice 0 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k";
+  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k");
 
-
-  extend_hamm (kperceptron k_3) |> train_slices 1000 |>
-      List.iter (run_test ~print:real_run "KP3*" ~n:10000);
-*)
 (*
   extend_hamm_incr perceptron |> train_full |>
       run_test ~print:real_run "Hamm";
@@ -360,5 +360,9 @@ let train () =
 
 let predict () = ()
 
+let test () = 
+  kperceptron3_slice 0 2000 |> extend_hamm |> run_test "kp3_0_2k"
 
-let () = if exe = "predict" then predict () else train ()
+let () = 
+  Ocamlviz.init ();
+  if exe = "./test" then test () else if exe = "./train" then train () else predict ()
