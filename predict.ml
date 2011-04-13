@@ -21,7 +21,7 @@ let loops = 10
 let train_data = Datafile.get_matrix "training.ba"
 let train_labels = Datafile.read_label_file "training_label.txt"
 
-let test_data = Datafile.get_matrix (if real_run then Sys.argv.(1) else "development.ba")
+let test_data = Datafile.get_matrix (if real_run then Sys.argv.(1) else "development.txt.ba")
 let test_labels = Datafile.read_label_file "development_label.txt"
 
 let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
@@ -29,7 +29,6 @@ let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
 let norm ais = Vec.sqr_nrm2 ais |> sqrt
 let zeros ais = (1--Array1.dim ais) |> Enum.fold (fun acc i -> if ais.{i} = 0. then acc+1 else acc) 0
 let get_i (m:matrix) i = Array2.slice_right m i
-let predict_many d f = (1--Array2.dim2 d) |> Enum.map (fun i -> f (get_i d i))
 let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
 
 type bpredictor = 
@@ -41,7 +40,7 @@ type bpredictor =
 
 type cpredictor = 
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
-  | One_one of (int * int) list * bpredictor array
+  | One_one of (int * int) array * bpredictor array (* i vs j pairs, with a predictor for each *)
   | Svm of string (* filename with serialized predictor *)
 
 (********************************************)
@@ -276,7 +275,7 @@ let extend_one_one gen_classifier =
   let gdc = Map.map (Array.of_list |- tap (Array.sort Int.compare)) grouped_data_by_category in
   let category_pairs = 
     Map.keys gdc |> map (fun i -> Map.keys gdc // (fun x -> x > i) /@ (fun j -> i,j)) 
-    |> Enum.flatten |> List.of_enum 
+    |> Enum.flatten |> Array.of_enum 
   in
   let datapoints i j =
     let get c = Map.find c gdc |> Array.enum in
@@ -284,7 +283,7 @@ let extend_one_one gen_classifier =
   in
   let classes i data = let pos = Map.find i gdc in Array.map (search pos) data |> vec_of_arr in
   let make_classifier (i,j) = let data = datapoints i j in gen_classifier data (classes i data) in
-  let ps = List.map make_classifier category_pairs |> Array.of_list in
+  let ps = Array.map make_classifier category_pairs in
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
   One_one (category_pairs, ps)
 
@@ -347,31 +346,29 @@ let nearest_in label_map pred_lab =
 
 let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :: (to_bits (n-1) (x asr 1))
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
+let predict_many f d = Array.init (Array2.dim2 d) (fun i -> f (get_i d (i+1)))
 
 let predict_cat = function
   | Hamm (bpreds, cat_map) ->
-    let decode_arr = Array.init (1 lsl (Array.length bpreds)) (fun i -> nearest_in cat_map i) in
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
-    let decode_bits l = 
-      let (str, bits) = List.fold_left merge_qb (1.,0) l in
-      str, decode_arr.(bits)
+    let bits = Array.length bpreds in
+    let decode_bits = 
+      if bits < 20 then (* precompute decoding map when it's not too large *)
+	let decode_arr = Array.init (1 lsl bits) (fun i -> nearest_in cat_map i) in
+	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in str, decode_arr.(bits))
+      else
+	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in str, nearest_in cat_map bits)
     in
-    (fun xs -> 
-      let decisions = Array.map (fun cl -> predict_many xs cl) classifiers in
-      Enum.from (fun () -> get_heads decisions) |> Enum.map decode_bits
-    )
+    predict_many (fun d -> Array.map (fun cl -> cl d) classifiers |> decode_bits)
   | One_one (pairs,bpreds) ->
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
     let decode decisions = 
       let votes = Array.create (category_count+1) 0 in
-      List.iter2 (fun (i,j) d -> if d > 0. then votes.(i) <- votes.(i) + 1 else votes.(j) <- votes.(j) + 1) pairs decisions;
+      Array.iter2 (fun (i,j) d -> if d > 0. then votes.(i) <- votes.(i) + 1 else votes.(j) <- votes.(j) + 1) pairs decisions;
       let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
       float votes.(winner) /. float category_count, winner
     in
-    (fun xs -> 
-      let decisions = Array.map (fun cl -> predict_many xs cl) classifiers in
-      Enum.from (fun () -> get_heads decisions) |> Enum.map decode
-    )
+    predict_many (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
   | Svm _file -> assert false
 (*    let m = svm_load_model ~file in
     (fun xs -> svm_predict_32 ~m ~x:xs) *)
@@ -431,11 +428,26 @@ let print_pred oc (i,ps) =
 let output_preds oc ps =
   Enum.print ~first:"" ~last:"" ~sep:"" print_pred oc (Map.enum ps)
 
+let print_pred_conf oc (conf, pred) =
+  fprintf oc "%d\t%f\n" pred conf
+
+let print_cloned_head n ro ps = 
+  let preds = Enum.clone ps |> Enum.take n |> Array.of_enum  in
+  let data = Array2.sub_right test_data ro n in
+  for i = 0 to n-1 do
+    printf "Data:%a\npred:%a\n" 
+      (Array.print print_float) (get_i data (i+1)|> Array1.to_array) 
+      print_pred_conf preds.(i)
+  done
+
 let run_test ?(n = 1_000) name (cpred: cpredictor) = 
   let t0 = Sys.time () in
   let rand_offset = Random.int (Array2.dim2 test_data - n) in
-  Array2.sub_right test_data rand_offset n |> predict_cat cpred 
-  |> best_predictions |> evaluate |> printf "%s Overall: %.2f (%.2fs)\n%!" name (Sys.time () -. t0)
+  let eval = Array2.sub_right test_data rand_offset n |> predict_cat cpred |> Array.enum
+(*  |> tap (print_cloned_head 10 rand_offset) *)
+  |> best_predictions |> evaluate 
+  in
+  printf "%s Overall: %.2f (%.2fs)\n%!" name eval (Sys.time () -. t0)
  
 let marshal_file fn_base x =
   let tm = Unix.time() |> Unix.localtime in
@@ -450,11 +462,11 @@ let marshal_file fn_base x =
   Legacy.Marshal.to_channel oc x [];
   Pervasives.close_out oc
 
-let crossval partial_pred param_values =
-    List.iter (fun i -> partial_pred i |> run_test ("crossvalidate:" ^ string_of_float i)) param_values
+let crossval ~f ~xs =
+    List.iter (fun i -> f i |> run_test ("crossvalidate:" ^ string_of_float i)) xs
 
-let crossval_int partial_pred param_values =
-    List.iter (fun i -> partial_pred i |> run_test ("crossvalidate:" ^ string_of_int i)) param_values
+let crossval_int ~f ~xs =
+    List.iter (fun i -> f i |> run_test ("crossvalidate:" ^ string_of_int i)) xs
 
 (***************************************)
 (**        MAIN        *****************)
@@ -466,10 +478,8 @@ let train () =
   kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k";
   train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k")
 
-let print_pred_conf oc i (conf, pred) =
-  fprintf oc "%d\t%f\t%d\n" pred conf i
 let predict p oc =
-  predict_cat p test_data |> Enum.iteri (print_pred_conf oc)
+  predict_cat p test_data |> Array.iter (print_pred_conf oc)
 
 let pred_read fn =
   let ic = Pervasives.open_in_bin fn in
@@ -482,12 +492,17 @@ let predict_scan () = ()
   (* rename to used.* when done *)
 
 let test () = 
-(* best: 2K?
-  crossval_int (fun i ->   
-    let rand_offset = Random.int (Array2.dim2 train_data - i) in
-    kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
-*)
-  kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1";
+  (* best: 2K?
+     crossval_int (fun i ->   
+     let rand_offset = Random.int (Array2.dim2 train_data - i) in
+     kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
+  *)
+  crossval_int ~xs:(3--31 |> List.of_enum)
+    ~f:(fun i ->   
+      let rand_offset = Random.int (Array2.dim2 train_data - 2000) in
+      kperceptron_slice (gt_rbf 10.) kp_core 100 rand_offset 2000 |> extend_hamm i) ;
+  
+  (*kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1"; *)
   crossval (fun i ->   
     let rand_offset = Random.int (Array2.dim2 train_data - 2000) in
     kperceptron_slice (gt_pow i) kp_core 100 rand_offset 2000 |> extend_hamm 16) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]

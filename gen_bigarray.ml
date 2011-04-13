@@ -6,13 +6,13 @@ let () = if Array.length Sys.argv < 2 then printf "Usage: %s [input_file]" Sys.a
 let input_file = Sys.argv.(1)
 let output_file = input_file ^ ".ba"
 
-let use_std_trans = false
+let use_std_trans = true
 
 let cols = Datafile.cols
-let rows = Datafile.rows
+let rows = Sys.argv.(2) |> int_of_string
 
 let () = 
-  let mmap = Datafile.write output_file in
+  let mmap = Datafile.write rows output_file in
   let maxs = Array.create cols min_float in
   let push_x row col x =
     if row land 0xff = 0 then print_string ".";
@@ -23,11 +23,8 @@ let () =
   Enum.iteri (fun row d -> List.iteri (push_x row) d; mmap.{cols, row+1} <- 1.) data;
   let t0 = Sys.time () in
   printf "Reading took: %.2f s\n" t0;
-  if use_std_trans then (
-    printf "Using standard scaling\n";
-    List.iteri (fun i x -> maxs.(i) <- x) Datafile.scaling;
-  ) else
-    Array.print ~last:"|]\n" (fun oc f -> fprintf oc "%2.0f" f) stdout maxs;
+  let maxs = if use_std_trans then (printf "Using standard scaling\n"; Datafile.scaling) else 
+      (Array.print ~last:"|]\n" (fun oc f -> fprintf oc "%2.0f" f) stdout maxs; maxs) in
   IO.flush_all ();
   for j = 1 to rows do
     for i = 1 to cols do
