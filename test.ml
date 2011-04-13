@@ -1,1 +1,5 @@
-let () = Predict.test ()
+open Predict
+
+let main = ref test
+
+let () = !main ()

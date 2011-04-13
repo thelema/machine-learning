@@ -14,7 +14,6 @@ let print_float5 oc x = fprintf oc "%.5f" x
 
 let real_run = Array.length Sys.argv > 1
 let debug = false
-let cat_bits = ref 16
 let category_count = 164
 let top_n = 100
 let loops = 10
@@ -100,13 +99,13 @@ let kp_core kij (labels: vec) (ais: vec) =
       ais.{i} <- ais.{i} +. yi
   done
 
-let cap_phi s p m = (s *. p) *. (s *. p) +. 2. *. s *. p *. (1. -. p *. m)
+let cap_psi s p m = (s *. p) *. (s *. p) +. 2. *. s *. p *. (1. -. p *. m)
 
 let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
   | [] -> acc
   | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
 
-let rec ft_core b =
+let rec ft_core b =  (* FIXME *)
   let inc = ref Deque.empty in
   let set = ref Set.empty in
   let base = ref 0 in
@@ -223,8 +222,6 @@ let svm (data: matrix64) (labels: vec) =
 (** EXTENDING 2-category to multi-category **)
 (********************************************)
 
-let mask = (1 lsl !cat_bits) - 1
-
 type ('a,'b) manual_cache = {
   get : 'a -> 'b; 
   del : 'a -> unit; 
@@ -239,10 +236,10 @@ let make_map ~gen =
    del = (fun k -> m := BatMap.remove k !m);
    enum = (fun () -> BatMap.enum !m) }
 
-let extend_hamm gen_classifier =
+let extend_hamm cat_bits gen_classifier =
   printf "Training Hamming Classifiers%!";
   let n = Array1.dim train_labels in
-  let mask = (1 lsl !cat_bits) - 1 in
+  let mask = (1 lsl cat_bits) - 1 in
   let {get = map_cat; enum=cat_mapping} = 
     make_map (fun _ -> Random.bits () land mask) in
   let bit_labels i x = if ((map_cat x) asr i) land 1 = 1 then 1. else -1. in
@@ -252,7 +249,7 @@ let extend_hamm gen_classifier =
     ls 
   in
   printf ".%!";
-  let all_labels = Array.init !cat_bits gen_labels in
+  let all_labels = Array.init cat_bits gen_labels in
   printf ".%!";
   let cat_map = Array.create (category_count+1) 0 in
   printf ".%!";
@@ -314,7 +311,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_3 x (Array2.slice_right train_data offs.(i)); 
+	t := !t +. ais.{i} *. k_3 x (Array2.slice_right train_data offs.(i-1)); 
       done; 
       !t +. 0.)
   | Kern_rbf (sigma, offs, ais) -> 
@@ -323,7 +320,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_rbf sigma x (Array2.slice_right train_data offs.(i)); 
+	t := !t +. ais.{i} *. k_rbf sigma x (Array2.slice_right train_data offs.(i-1)); 
       done; 
       !t +. 0.)
   | Kern_pow (p, offs, ais) -> 
@@ -332,7 +329,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_pow p x (Array2.slice_right train_data offs.(i)); 
+	t := !t +. ais.{i} *. k_pow p x (Array2.slice_right train_data offs.(i-1)); 
       done; 
       !t +. 0.)
 
@@ -353,7 +350,7 @@ let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 e
 
 let predict_cat = function
   | Hamm (bpreds, cat_map) ->
-    let decode_arr = Array.init (1 lsl !cat_bits) (fun i -> nearest_in cat_map i) in
+    let decode_arr = Array.init (1 lsl (Array.length bpreds)) (fun i -> nearest_in cat_map i) in
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
     let decode_bits l = 
       let (str, bits) = List.fold_left merge_qb (1.,0) l in
@@ -434,10 +431,11 @@ let print_pred oc (i,ps) =
 let output_preds oc ps =
   Enum.print ~first:"" ~last:"" ~sep:"" print_pred oc (Map.enum ps)
 
-let run_test ?(n = 10_000) name (cpred: cpredictor) = 
+let run_test ?(n = 1_000) name (cpred: cpredictor) = 
+  let t0 = Sys.time () in
   let rand_offset = Random.int (Array2.dim2 test_data - n) in
   Array2.sub_right test_data rand_offset n |> predict_cat cpred 
-  |> best_predictions |> evaluate |> printf "%s Overall: %.2f\n%!" name
+  |> best_predictions |> evaluate |> printf "%s Overall: %.2f (%.2fs)\n%!" name (Sys.time () -. t0)
  
 let marshal_file fn_base x =
   let tm = Unix.time() |> Unix.localtime in
@@ -465,8 +463,8 @@ let crossval_int partial_pred param_values =
 let train () = 
 (*  kperceptron3_slice 1 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k"; *)
 (*  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k"); *)
-  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm |> marshal_file "hamm_kpr_1_2k";
-  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k")
+  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k";
+  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k")
 
 let print_pred_conf oc i (conf, pred) =
   fprintf oc "%d\t%f\t%d\n" pred conf i
@@ -492,7 +490,7 @@ let test () =
   kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1";
   crossval (fun i ->   
     let rand_offset = Random.int (Array2.dim2 train_data - 2000) in
-    kperceptron_slice (gt_pow i) kp_core 100 rand_offset 2000 |> extend_hamm) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]
+    kperceptron_slice (gt_pow i) kp_core 100 rand_offset 2000 |> extend_hamm 16) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]
 
 
 
