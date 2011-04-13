@@ -6,22 +6,24 @@ let rows = 1_000_000
 let cols = 900
 
 let kind = float32
+let kind64 = float64
 let layout = fortran_layout
-
-let read fn = 
-  let fh = openfile fn [O_RDONLY] 0o755 in
-  let mmap = Array2.map_file fh kind layout false cols rows in
-  let get_row i = Array2.slice_right mmap i in
-  (1--rows) |> Enum.map get_row
 
 let get_matrix fn =
   let fh = openfile fn [O_RDONLY] 0o755 in
-  Array2.map_file fh kind layout false cols rows
+  Array2.map_file fh kind layout false cols (-1)
 
 let write output_file =
   let fh = openfile output_file [O_RDWR;O_CREAT] 0o755 in
   Array2.map_file fh kind layout true cols rows
   
+let get_matrix64 fn =
+  let fh = openfile fn [O_RDONLY] 0o755 in
+  Array2.map_file fh kind64 layout false cols (-1)
+
+let write_64 output_file =
+  let fh = openfile output_file [O_RDWR;O_CREAT] 0o755 in
+  Array2.map_file fh kind64 layout true cols rows
 
 let read_text fn =
   File.lines_of fn |> Enum.map (fun line -> String.nsplit line " " |> List.map float_of_string)
@@ -35,16 +37,24 @@ let scaling = [54; 75; 28; 386; 52; 43; 289; 113; 44; 74; 22; 45; 76; 37; 47; 21
 open Lacaml.Impl.S (* Single-precision reals *)
 let print_float oc x = Printf.fprintf oc "%.3f" x
 
+
+
 (* Check data *)
 let check_data train_file = 
+  let read fn = 
+    let fh = openfile fn [O_RDONLY] 0o755 in
+    let mmap = Array2.map_file fh kind layout false cols (-1) in
+    let get_row i = Array2.slice_right mmap i in
+    (1--rows) |> Enum.map get_row
+  in
   let d0 = read_text "/home/thelema/development.txt" in
   let d1 = read train_file |> Enum.map Vec.to_list in
   let epsilon = 0.0001 in let float_eq a b = abs_float (a -. b) < epsilon in
-  let eq row l1 l2 = 
-    if List.map2 ( *. ) l2 scaling |> List.for_all2 float_eq l1 then () else (
-      Printf.printf "Verification failed on row %d:\ntext:%a\npack:%a\n" row
-	(List.print print_float) l1 (List.print print_float) l2
-    )
-  in
-  Enum.iter2i eq d0 d1;
-  Printf.printf "Data verified\n"
+			  let eq row l1 l2 = 
+			    if List.map2 ( *. ) l2 scaling |> List.for_all2 float_eq l1 then () else (
+			      Printf.printf "Verification failed on row %d:\ntext:%a\npack:%a\n" row
+				(List.print print_float) l1 (List.print print_float) l2
+			    )
+			  in
+			  Enum.iter2i eq d0 d1;
+			  Printf.printf "Data verified\n"

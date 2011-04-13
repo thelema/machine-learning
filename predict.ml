@@ -6,7 +6,6 @@ open Lacaml.Impl.S (* Single-precision reals *)
 open Bigarray
 
 type matrix = (float, float32_elt, fortran_layout) Array2.t
-type matrix64 = (float, float64_elt, fortran_layout) Array2.t
 type cats = (int, int8_unsigned_elt, fortran_layout) Array1.t
 type 'a pred_f_t = matrix -> (float * 'a) Enum.t
 
@@ -36,14 +35,15 @@ let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
 
 type bpredictor = 
   | Dot of float array (* weights of different features *)
+  | Dot_plus of float array * float
   | Kern_3 of int array * float array (* offsets of data used, ais*)
   | Kern_rbf of float * int array * float array (* sigma, offsets of data used, ais*)
   | Kern_pow of float * int array * float array (* exponent, offsets of data used, ais*)
-  | Svm of string (* filename with serialized predictor *)
 
 type cpredictor = 
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
   | One_one of (int * int) list * bpredictor array
+  | Svm of string (* filename with serialized predictor *)
 
 (********************************************)
 (** Two-category learners *******************)
@@ -68,59 +68,106 @@ let perceptron (data: matrix) (labels: vec) =
   scal (1. /. float n) acc;
   Dot (Array1.to_array acc)
 
+let perceptron_b (data: matrix) (labels: vec) =
+  let w = Vec.make0 Datafile.cols in
+  let b = ref 0. in
+  let acc = Vec.make0 Datafile.cols in
+  let bacc = ref 0. in
+  let n = Array1.dim labels in
+  for i = 1 to n do
+    let xi = Array2.slice_right data i in
+    let yi = labels.{i} in
+    if !b +. dot xi w *. yi > 0. then incr right
+    else (axpy ~alpha:yi ~x:xi w; b := !b +. 0.2 *. yi;);
+    let n2 = Vec.sqr_nrm2 w +. !b *. !b in
+    if n2 > 1000. then (scal (800. /. n2) w; b := (800. /. n2) *. !b);
+    ignore(Vec.add ~z:acc acc w); bacc := !bacc +. !b;
+  done;
+  count := !count + n;
+  scal (1. /. float n) acc;
+  bacc := !bacc /. float n;
+  Dot_plus (Array1.to_array acc, !bacc)
+
 let rec pred (kij: matrix) (ais: vec) i acc j = 
   if j < 1 then acc else 
     pred kij ais i (ais.{j} *. kij.{j,i} +. acc) (j-1) 
 
-let kp_core n kij (labels: vec) (ais: vec) =
+let kp_core kij (labels: vec) (ais: vec) =
+  let n = Array1.dim ais in
   for i = 1 to n do
     let yi = labels.{i} in
     if yi *. (pred kij ais i 0. n) <= 0. then 
       ais.{i} <- ais.{i} +. yi
   done
- 
-let kperceptron n kij labels =
-  let ais = Vec.make0 n in
-(*  printf "Training: %d data items %d times...%!" n (10*loops); 
-  let t0 = Sys.time () in*)
-  for l = 1 to 10 * loops do kp_core n kij labels ais done;
-(*  printf "Done(%.2fs). (ai_norm,zeros = %.2f,%d)\n%!" (Sys.time () -. t0) (norm ais) (zeros ais); *)
-  ais
+
+let cap_phi s p m = (s *. p) *. (s *. p) +. 2. *. s *. p *. (1. -. p *. m)
+
+let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
+  | [] -> acc
+  | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
+
+let rec ft_core b =
+  let inc = ref Deque.empty in
+  let set = ref Set.empty in
+  let base = ref 0 in
+  fun kij (labels: vec) (ais: vec) ->
+    let n = Array1.dim ais in
+    for i = 1 to n do
+      let yi = labels.{i} in
+      if yi *. (sparse_pred kij ais i 0. (Deque.to_list !inc)) <= 0. then
+	let s = Set.add i !set in
+	let h = Deque.cons i !inc in
+	if Set.cardinal s <= b then (
+	  ais.{i} <- 1.;
+	  inc := h; set := s;
+	) else match Deque.rear h with
+	  | None -> assert false
+	  | Some (h, r) ->
+	    let phi = 0.8 in (* not the real thing, should be something magical *)
+	    scal phi ais;
+	    ais.{r} <- 0.;
+	    ais.{i} <- 1.;
+	    inc := h; set := Set.remove r s;
+    done;
+    base := !base + n
 
 let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
-let gen_kij_rbf two_sig_sq n offsets =
+let gen_kij_rbf two_sig_sq offsets =
+  let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using rbf(x,y)...%!" n n; *)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i)) in
+    let xi = (Array2.slice_right train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{i,j} <- k_rbf two_sig_sq xi (Array2.slice_right train_data offsets.(j))
+      kij.{i,j} <- k_rbf two_sig_sq xi (Array2.slice_right train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
   kij
 
 let k_3 x1 x2 = let a = (1. +. dot x1 x2) in a *. a *. a
-let gen_kij_3 n offsets =
+let gen_kij_3 offsets =
+  let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i)) in
+    let xi = (Array2.slice_right train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j))
+      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
   kij
 
 let k_pow pow x1 x2 = let a = (1. +. dot x1 x2) in a ** pow
-let gen_kij_pow pow n offsets =
+let gen_kij_pow pow offsets =
+  let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i)) in
+    let xi = (Array2.slice_right train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j))
+      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -128,27 +175,36 @@ let gen_kij_pow pow n offsets =
 
 
 let clean offs a =
-  let offs = Array.filteri (fun i _ -> a.{i} <> 0.) offs in
-  let a = Array1.to_array a |> Array.filter ((<>) 0.) in
-  (a, offs)
+  let a = Array1.to_array a in
+  let offs' = Array.filteri (fun i _ -> a.(i) <> 0.) offs in
+  let a' = Array.filter ((<>) 0.) a in
+  printf "Support vectors: %d of %d\n%!" (Array.length a') (Array.length a);
+  (a', offs')
 
-let kperceptron_offs (genk,tag_v)  len offs labels_arr =
-  let kij = genk len offs in
-  Array.map (kperceptron len kij |- clean offs |- tag_v) labels_arr
+let kperceptron_offs (genk,tag_v) core t offs labels_arr =
+  let kij = genk offs in
+  let run_perc ls =
+    let ais = Vec.make0 (Array.length offs) in
+    for l = 1 to t do core kij ls ais done;
+    clean offs ais |> tag_v
+  in  
+  Array.map run_perc labels_arr
 
-let kperceptron_slice gk off len labels_arr =
+let kperceptron_slice gk core t off len labels_arr =
   let offs = (off --^ (off + len) |> Array.of_enum) in 
-  kperceptron_offs gk len offs labels_arr
+  kperceptron_offs gk core t offs labels_arr
 
-let kperceptron_elems (genk, tag_v) offs labels =
-  let len = Array.length offs in
-  if Array1.dim labels <> len then invalid_arg "Labels must have the same length as offs";
-  let kij = genk len offs in
-  kperceptron len kij labels |> clean offs |> tag_v
+let kperceptron_elems (genk, tag_v) core t offs labels =
+  if Array1.dim labels <> Array.length offs then invalid_arg "Labels must have the same length as offs";
+  let kij = genk offs in
+  let ais = Vec.make0 (Array.length offs) in
+  for l = 1 to t do core kij labels ais done;
+  clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
 let gt_rbf sigma = (gen_kij_rbf sigma, fun (a,o) -> Kern_rbf(sigma,o,a))
 let gt_pow p = (gen_kij_pow p, fun (a,o) -> Kern_pow (p, o, a))
+
 (*
 let () = printf "Reading..%!"
 let t0 = Sys.time()
@@ -157,10 +213,12 @@ let m = svm_train ~kernel_type:LINEAR v1
 let () = printf "Done(%.2f)\n%!" (Sys.time () -. t0)
  *)
 
+(*
+
 let svm (data: matrix64) (labels: vec) = 
   let _model = svm_train ~svm_type:C_SVC ~kernel_type:RBF data (* labels *) in
   assert false
-
+*)
 (********************************************)
 (** EXTENDING 2-category to multi-category **)
 (********************************************)
@@ -182,6 +240,7 @@ let make_map ~gen =
    enum = (fun () -> BatMap.enum !m) }
 
 let extend_hamm gen_classifier =
+  printf "Training Hamming Classifiers%!";
   let n = Array1.dim train_labels in
   let mask = (1 lsl !cat_bits) - 1 in
   let {get = map_cat; enum=cat_mapping} = 
@@ -192,10 +251,13 @@ let extend_hamm gen_classifier =
     for j = 1 to n do ls.{j} <- bit_labels i train_labels.{j} done; 
     ls 
   in
+  printf ".%!";
   let all_labels = Array.init !cat_bits gen_labels in
+  printf ".%!";
   let cat_map = Array.create (category_count+1) 0 in
+  printf ".%!";
   Enum.iter (fun (i,b) -> cat_map.(i) <- b) (cat_mapping ());
-  printf "Training Hamming Classifiers...\n%!";
+  printf ".\n%!";
   let t0 = Sys.time () in
   let classifiers = gen_classifier all_labels in
   printf "Done training (%.2fs)\n%!" (Sys.time () -. t0);
@@ -229,13 +291,22 @@ let extend_one_one gen_classifier =
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
   One_one (category_pairs, ps)
 
+
+(***************************************)
+(***********     SVM      **************)
+(***************************************)
+
+
+
+
 (***************************************)
 (** Prediction functions ***************)
 (***************************************)
 
 let predict_b = 
   function
-  | Dot warr -> let w = Array1.of_array Datafile.kind Datafile.layout warr in (fun x -> dot w x)
+  | Dot warr -> let w = vec_of_arr warr in (fun x -> dot w x)
+  | Dot_plus (warr, b) -> let w = vec_of_arr warr in (fun x -> dot w x +. b)
   | Kern_3 (offs, ais) ->
     let len = Array.length offs in
 (*    printf "Kern3 decoder (off %d; len %d, %d ais)\n" off len (Array.length ais); *)
@@ -264,7 +335,6 @@ let predict_b =
 	t := !t +. ais.{i} *. k_pow p x (Array2.slice_right train_data offs.(i)); 
       done; 
       !t +. 0.)
-  | Svm _fn -> assert false
 
 let get_heads enum_l = 
   Array.fold_left (fun acc x -> match Enum.get x with 
@@ -305,6 +375,9 @@ let predict_cat = function
       let decisions = Array.map (fun cl -> predict_many xs cl) classifiers in
       Enum.from (fun () -> get_heads decisions) |> Enum.map decode
     )
+  | Svm _file -> assert false
+(*    let m = svm_load_model ~file in
+    (fun xs -> svm_predict_32 ~m ~x:xs) *)
 
 (***************************************)
 (** Scoring and framework **************)
@@ -392,8 +465,8 @@ let crossval_int partial_pred param_values =
 let train () = 
 (*  kperceptron3_slice 1 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k"; *)
 (*  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k"); *)
-  kperceptron_slice (gt_rbf 50.) 1 2000 |> extend_hamm |> marshal_file "hamm_kpr_1_2k";
-  train_slices 1000 (gt_rbf 50. |> kperceptron_slice) |> List.iter (extend_hamm |- marshal_file "hamm_kpr_slc_1k")
+  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm |> marshal_file "hamm_kpr_1_2k";
+  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k")
 
 let print_pred_conf oc i (conf, pred) =
   fprintf oc "%d\t%f\t%d\n" pred conf i
@@ -416,10 +489,10 @@ let test () =
     let rand_offset = Random.int (Array2.dim2 train_data - i) in
     kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
 *)
-  kperceptron_elems gt_k3 |> extend_one_one |> run_test "kp3_5k_1-1";
+  kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1";
   crossval (fun i ->   
     let rand_offset = Random.int (Array2.dim2 train_data - 2000) in
-    kperceptron_slice (gt_pow i) rand_offset 2000 |> extend_hamm) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]
+    kperceptron_slice (gt_pow i) kp_core 100 rand_offset 2000 |> extend_hamm) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]
 
 
 
