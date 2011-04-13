@@ -32,12 +32,13 @@ let norm ais = Vec.sqr_nrm2 ais |> sqrt
 let zeros ais = (1--Array1.dim ais) |> Enum.fold (fun acc i -> if ais.{i} = 0. then acc+1 else acc) 0
 let get_i (m:matrix) i = Array2.slice_right m i
 let predict_many d f = (1--Array2.dim2 d) |> Enum.map (fun i -> f (get_i d i))
-
+let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
 
 type bpredictor = 
   | Dot of float array (* weights of different features *)
   | Kern_3 of int array * float array (* offsets of data used, ais*)
   | Kern_rbf of float * int array * float array (* sigma, offsets of data used, ais*)
+  | Kern_pow of float * int array * float array (* exponent, offsets of data used, ais*)
   | Svm of string (* filename with serialized predictor *)
 
 type cpredictor = 
@@ -126,29 +127,28 @@ let gen_kij_pow pow n offsets =
   kij
 
 
-let clean a offs =
+let clean offs a =
   let offs = Array.filteri (fun i _ -> a.{i} <> 0.) offs in
   let a = Array1.to_array a |> Array.filter ((<>) 0.) in
   (a, offs)
-  
 
-let kperceptron_offs genk len offs labels_arr =
+let kperceptron_offs (genk,tag_v)  len offs labels_arr =
   let kij = genk len offs in
-  let tag a = let a, offs = clean a offs in Kern_3 (offs, a) in
-  Array.map (kperceptron len kij |- tag) labels_arr
+  Array.map (kperceptron len kij |- clean offs |- tag_v) labels_arr
 
-let kperceptron3_offs = kperceptron_offs gen_kij_3
-let kperceptron3_offs sigma = kperceptron_offs (gen_kij_rbf sigma)
-
-let kperceptron_slice genk off len labels_arr =
+let kperceptron_slice gk off len labels_arr =
   let offs = (off --^ (off + len) |> Array.of_enum) in 
-  kperceptron_offs genk len offs labels_arr
+  kperceptron_offs gk len offs labels_arr
 
-let kperceptron3_slice = kperceptron_slice gen_kij_3
-let kperceptron_rbf_slice sigma = kperceptron_slice (gen_kij_rbf sigma)
-let kperceptron_pow_slice pow = kperceptron_slice (gen_kij_pow pow)
+let kperceptron_elems (genk, tag_v) offs labels =
+  let len = Array.length offs in
+  if Array1.dim labels <> len then invalid_arg "Labels must have the same length as offs";
+  let kij = genk len offs in
+  kperceptron len kij labels |> clean offs |> tag_v
 
-
+let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
+let gt_rbf sigma = (gen_kij_rbf sigma, fun (a,o) -> Kern_rbf(sigma,o,a))
+let gt_pow p = (gen_kij_pow p, fun (a,o) -> Kern_pow (p, o, a))
 (*
 let () = printf "Reading..%!"
 let t0 = Sys.time()
@@ -223,7 +223,7 @@ let extend_one_one gen_classifier =
     let get c = Map.find c gdc |> Array.enum in
     Enum.append (get i) (get j) |> Random.shuffle
   in
-  let classes i data = let pos = Map.find i gdc in Array.map (search pos) data in
+  let classes i data = let pos = Map.find i gdc in Array.map (search pos) data |> vec_of_arr in
   let make_classifier (i,j) = let data = datapoints i j in gen_classifier data (classes i data) in
   let ps = List.map make_classifier category_pairs |> Array.of_list in
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
@@ -253,6 +253,15 @@ let predict_b =
       let t = ref 0. in 
       for i = 1 to len do 
 	t := !t +. ais.{i} *. k_rbf sigma x (Array2.slice_right train_data offs.(i)); 
+      done; 
+      !t +. 0.)
+  | Kern_pow (p, offs, ais) -> 
+    let len = Array.length offs in
+    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
+    (fun x -> 
+      let t = ref 0. in 
+      for i = 1 to len do 
+	t := !t +. ais.{i} *. k_pow p x (Array2.slice_right train_data offs.(i)); 
       done; 
       !t +. 0.)
   | Svm _fn -> assert false
@@ -383,15 +392,8 @@ let crossval_int partial_pred param_values =
 let train () = 
 (*  kperceptron3_slice 1 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k"; *)
 (*  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k"); *)
-  kperceptron_rbf_slice 50. 1 2000 |> extend_hamm |> marshal_file "hamm_kpr_1_2k";
-  train_slices 1000 (kperceptron_rbf_slice 50.) |> List.iter (extend_hamm |- marshal_file "hamm_kpr_slc_1k")
-
-(*
-  extend_hamm_incr perceptron |> train_full |>
-      run_test ~print:real_run "Hamm";
-  extend_one_one_incr perceptron |> train_full |>
-      run_test ~print:real_run "1-1 ";
- *)
+  kperceptron_slice (gt_rbf 50.) 1 2000 |> extend_hamm |> marshal_file "hamm_kpr_1_2k";
+  train_slices 1000 (gt_rbf 50. |> kperceptron_slice) |> List.iter (extend_hamm |- marshal_file "hamm_kpr_slc_1k")
 
 let print_pred_conf oc i (conf, pred) =
   fprintf oc "%d\t%f\t%d\n" pred conf i
@@ -414,9 +416,10 @@ let test () =
     let rand_offset = Random.int (Array2.dim2 train_data - i) in
     kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
 *)
-  crossval_int (fun i ->   
+  kperceptron_elems gt_k3 |> extend_one_one |> run_test "kp3_5k_1-1";
+  crossval (fun i ->   
     let rand_offset = Random.int (Array2.dim2 train_data - 2000) in
-    kperceptron_pow_slice i rand_offset 2000 |> extend_hamm) [1; 2; 3; 4; 5; 6; 7; 8; 9; 10]
+    kperceptron_slice (gt_pow i) rand_offset 2000 |> extend_hamm) [1.; 2.; 3.; 4.; 5.; 6.; 7.; 8.; 9.; 10.]
 
 
 
