@@ -105,35 +105,52 @@ let kp_core kij (labels: vec) (ais: vec) =
 
 let cap_psi s p m = (s *. p) *. (s *. p) +. 2. *. s *. p *. (1. -. p *. m)
 
+
+
 let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
   | [] -> acc
   | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
 
+
+(* magical formula for phi *)
+let solve_phi sir mu q m = 
+  let a = sir *. sir -. 2. *. sir *. mu in
+  let b = 2. *. sir in
+  let c = q -. (15. /. 32.) *. float m in
+  let p = (-. b +. sqrt (b *. b -. 4. *. a *. c) ) /. (2. *. a) in
+  if p < 0. then failwith "negative phi";
+  if p > 1. then 1. else p
+
 (* Implementation of a weak forgetron *)
 let rec ft_core b =  (* FIXME *)
   let inc = ref Deque.empty in
-  let set = ref Set.empty in
-  let base = ref 0 in
+  let map = ref Map.empty in
+  let q = ref 0. in (* sum of all cap_psi so far *)
+  let m = ref 0 in
   fun kij (labels: vec) (ais: vec) ->
     let n = Array1.dim ais in
+(*    printf "ft(%d)%!" n; *)
     for i = 1 to n do
+(*      if i land 0xfff = 0 then printf ".%!"; *)
       let yi = labels.{i} in
-      if yi *. (sparse_pred kij ais i 0. (Deque.to_list !inc)) <= 0. then
-	let s = Set.add i !set in
+      let mu_i = sparse_pred kij ais i 0. (Deque.to_list !inc) in
+      if yi *. mu_i <= 0. then
+	let s = Map.add i mu_i !map in
 	let h = Deque.cons i !inc in
-	if Set.cardinal s <= b then (
+	incr m;
+	if Deque.size h <= b then (
 	  ais.{i} <- 1.;
-	  inc := h; set := s;
+	  inc := h; map := s;
 	) else match Deque.rear h with
 	  | None -> assert false
 	  | Some (h, r) ->
-	    let phi = 0.9 in (* not the real thing, should be something magical *)
+	    let sr = ais.{r} in
+	    let phi = solve_phi sr (Map.find r s) !q !m in 
 	    scal phi ais;
 	    ais.{r} <- 0.;
 	    ais.{i} <- 1.;
-	    inc := h; set := Set.remove r s;
-    done;
-    base := !base + n
+	    inc := h; map := Map.remove r s;
+    done
 
 let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
 let gen_kij_rbf two_sig_sq offsets =
@@ -534,7 +551,7 @@ let test () =
   crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 4000) |> extend_hamm 50);
 *)
-  kperceptron_slice (gt_rbf 0.1) (ft_core 1000) 1000 (rand_slice 20000) |> extend_hamm 30 |> run_test "ft1K_rbf0.1_slice20K_hamm30"|>ignore;
+  kperceptron_slice (gt_rbf 0.1) (ft_core 1000) 1000 (rand_slice 10000) |> extend_hamm 30 |> run_test "ft1K_rbf0.1_slice20K_hamm30"|>ignore;
 
   
 ()
