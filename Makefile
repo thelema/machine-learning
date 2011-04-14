@@ -1,4 +1,4 @@
-SOURCES = predict.ml gen_bigarray.ml test.ml train.ml
+SOURCES = predict.ml gen_bigarray.ml test.ml train.ml best.ml
 
 all: predict.native
 
