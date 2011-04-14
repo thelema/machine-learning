@@ -4,7 +4,7 @@ open Printf
 let () = if Array.length Sys.argv < 2 then printf "Usage: %s [input_file]" Sys.argv.(0)
 
 let use_std_trans = true
-let sliced = true
+let sliced = false
 
 let input_file = Sys.argv.(1)
 let cols = Datafile.cols
@@ -34,9 +34,9 @@ let gen_output () =
   printf "Scaling took: %.2f s\n" (Sys.time () -. t0);
   ()
     
-(*
-let gen_sliced () = 
-  let label_data = read_label_file Sys.argv.(2) in
+
+let gen_sliced () = ()
+(*  let label_data = read_label_file Sys.argv.(2) in
 
   let num_cats = 164 in
   let label_files = Array.init num_cats (fun i -> input_file ^ ".ba." ^ (string_of_int i)) in

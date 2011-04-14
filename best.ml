@@ -8,7 +8,7 @@ let () =
   let infile = Sys.argv.(1) in
   let outall = infile ^ ".all" in
   let outbest = infile ^ ".best" in
-  let predictor = pred_read Sys.argv.(1) |> predict_cat in
+  let predictor = pred_read Sys.argv.(1) |> predict_cat |> predict_many in
   printf "Predicting...%!";
   let t0 = Sys.time() in
   let preds = predictor test_data in

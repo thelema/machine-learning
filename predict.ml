@@ -42,6 +42,7 @@ type cpredictor =
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
   | One_one of (int * int) array * bpredictor array (* i vs j pairs, with a predictor for each *)
   | Svm of string (* filename with serialized predictor *)
+  | Hedge of cpredictor array * float array
 
 (********************************************)
 (** Two-category learners *******************)
@@ -103,14 +104,11 @@ let kp_core kij (labels: vec) (ais: vec) =
       ais.{i} <- ais.{i} +. yi
   done
 
-let cap_psi s p m = (s *. p) *. (s *. p) +. 2. *. s *. p *. (1. -. p *. m)
-
-
+let cap_psi sr phi mu = (sr *. phi) *. (sr *. phi) +. 2. *. sr *. phi *. (1. -. phi *. mu)
 
 let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
   | [] -> acc
   | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
-
 
 (* magical formula for phi *)
 let solve_phi sir mu q m = 
@@ -145,10 +143,12 @@ let rec ft_core b =  (* FIXME *)
 	  | None -> assert false
 	  | Some (h, r) ->
 	    let sr = ais.{r} in
-	    let phi = solve_phi sr (Map.find r s) !q !m in 
+	    let mu = Map.find r s in
+	    let phi = solve_phi sr mu !q !m in 
 	    scal phi ais;
 	    ais.{r} <- 0.;
 	    ais.{i} <- 1.;
+	    q := !q +. cap_psi sr phi mu;
 	    inc := h; map := Map.remove r s;
     done
 
@@ -158,9 +158,9 @@ let gen_kij_rbf two_sig_sq offsets =
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using rbf(x,y)...%!" n n; *)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i-1)) in
+    let xi = (get_i train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{i,j} <- k_rbf two_sig_sq xi (Array2.slice_right train_data offsets.(j-1))
+      kij.{i,j} <- k_rbf two_sig_sq xi (get_i train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -172,9 +172,9 @@ let gen_kij_3 offsets =
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i-1)) in
+    let xi = (get_i train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j-1))
+      kij.{j,i} <- k_3 xi (get_i train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -186,9 +186,9 @@ let gen_kij_pow pow offsets =
   let kij = Array2.create float32 fortran_layout n n in
 (*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
   for i = 1 to n do
-    let xi = (Array2.slice_right train_data offsets.(i-1)) in
+    let xi = (get_i train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{j,i} <- k_3 xi (Array2.slice_right train_data offsets.(j-1))
+      kij.{j,i} <- k_3 xi (get_i train_data offsets.(j-1))
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -321,12 +321,6 @@ let extend_one_one off len gen_classifier =
 
 
 (***************************************)
-(** COMBINING MULTIPLE CPREDICTORS *****)
-(***************************************)
-
-let 
-
-(***************************************)
 (** Prediction functions ***************)
 (***************************************)
 
@@ -386,7 +380,7 @@ let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
 let predict_many f d = Array.init (Array2.dim2 d) (fun i -> f (get_i d (i+1)))
 
-let predict_cat = function
+let rec predict_cat = function
   | Hamm (bpreds, cat_map) ->
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
     let bits = Array.length bpreds in
@@ -397,7 +391,7 @@ let predict_cat = function
       else
 	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in str, nearest_in cat_map bits)
     in
-    predict_many (fun d -> Array.map (fun cl -> cl d) classifiers |> decode_bits)
+    (fun (d:vec) -> Array.map (fun cl -> cl d) classifiers |> decode_bits)
   | One_one (pairs,bpreds) ->
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
     let decode decisions = 
@@ -406,15 +400,52 @@ let predict_cat = function
       let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
       float votes.(winner) /. float category_count, winner
     in
-    predict_many (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
+    (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
   | Svm _file -> assert false
 (*    let m = svm_load_model ~file in
     (fun xs -> svm_predict_32 ~m ~x:xs) *)
+  | Hedge (es, ws) ->
+    let classifiers = Array.map (fun p -> predict_cat p) es in
+    let weight_sum = Array.reduce (+.) ws in
+    let decode ds =
+      let votes = Array.create (category_count + 1) 0. in
+      Array.iteri (fun i (str,l) -> votes.(l) <- votes.(l) +. ws.(i) *. str) ds;
+      let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
+      votes.(winner) /. weight_sum, winner
+    in
+    (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
 
-let print_cpred oc = function
+
+let rec print_cpred oc = function
   | Hamm (bps,cmap) -> fprintf oc "Hamm(%ax%d)" print_bpred bps.(0) (Array.length bps)
   | One_one (pairs, bpreds) -> fprintf oc "OVO(%ax%d)" print_bpred bpreds.(0) (Array.length bpreds)
   | Svm fn -> fprintf oc "Svm(%s)" fn
+  | Hedge (es, ws) -> 
+    fprintf oc "Hedge("; 
+    for i = 0 to Array.length es - 1 do 
+      fprintf oc "%a,%.3f" print_cpred es.(i) ws.(i) 
+    done;
+    fprintf oc ")"
+
+(***************************************)
+(** COMBINING MULTIPLE CPREDICTORS *****)
+(***************************************)
+
+let hedge experts (off, len) =
+  let n = Array.length experts in
+  let w = Array.create n 0. in
+  let preds = Array.map predict_cat experts in
+  for i = off to off+len-1 do
+    let xi = get_i train_data i in
+    let yi = train_labels.{i} in
+    let test_expert j e = 
+      let str,pred_y = e xi in 
+      if str > 0.01 && pred_y <> yi then w.(j) <- w.(j) *. 0.8 ** str
+    in
+    Array.iteri test_expert preds;
+  done;
+  Hedge (experts, w)
+
 
 (***************************************)
 (** Scoring and framework **************)
@@ -502,7 +533,7 @@ let run_test ?(n = 10_000) name (cpred: cpredictor) =
   marshal_file name cpred;
   let t0 = Sys.time () in
   let off,len = rand_slice ~range:(Array2.dim2 test_data) n in
-  let eval = Array2.sub_right test_data off len |> predict_cat cpred |> Array.enum
+  let eval = Array2.sub_right test_data off len |> predict_many (predict_cat cpred) |> Array.enum
 (*  |> tap (print_cloned_head 10 rand_offset) *)
   |> best_predictions 
   |> tap (fun ps -> File.with_file_out ("bests/" ^ name ^ ".bests") (fun oc -> output_preds oc ps))
@@ -526,7 +557,7 @@ let slice_shuffle n slice_len =
   1--slices |> Random.shuffle |> Array.enum |> Enum.map (fun i -> i --^ (i+slice_len)) |> Enum.flatten |> Array.of_enum
 
 let predict p oc =
-  predict_cat p test_data |> Array.iter (print_pred_conf oc)
+  predict_many (predict_cat p) test_data |> Array.iter (print_pred_conf oc)
 
 let pred_read fn =
   let ic = Pervasives.open_in_bin fn in
