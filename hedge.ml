@@ -6,4 +6,5 @@ let n = 1000
 
 let () = 
   let experts = args () |> map pred_read |> Array.of_enum in
-  hedge experts (rand_slice ~range:train_rows n) |> test_accuracy ~n "Hedge" |> ignore
+  let name = "Hedge(" ^ (args () |> List.of_enum |> String.concat ",") ^ ")" in
+  hedge experts (rand_slice ~range:train_rows n) |> test_accuracy ~n name |> ignore

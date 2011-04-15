@@ -582,7 +582,7 @@ let pred_read fn =
   let ic = Pervasives.open_in_bin fn in
   let (p: cpredictor) = Legacy.Marshal.from_channel ic in
   Pervasives.close_in ic;
-  print_cpred stdout p;
+  printf "Loaded predictor: %a\n%!" print_cpred p;
   p
 
 (***************************************)
