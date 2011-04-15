@@ -96,13 +96,15 @@ let rec pred (kij: matrix) (ais: vec) i acc j =
   if j < 1 then acc else 
     pred kij ais i (ais.{j} *. kij.{j,i} +. acc) (j-1) 
 
-let kp_core kij (labels: vec) (ais: vec) =
+let kp_core kij (ais: vec) (labels: vec) =
   let n = Array1.dim ais in
+  let errs = ref 0 in
   for i = 1 to n do
     let yi = labels.{i} in
     if yi *. (pred kij ais i 0. n) <= 0. then 
-      ais.{i} <- ais.{i} +. yi
-  done
+      (incr errs; ais.{i} <- ais.{i} +. yi)
+  done;
+  !errs
 
 let cap_psi sr phi mu = (sr *. phi) *. (sr *. phi) +. 2. *. sr *. phi *. (1. -. phi *. mu)
 
@@ -120,12 +122,13 @@ let solve_phi sir mu q m =
   if p > 1. then 1. else p
 
 (* Implementation of forgetron, a bounded memory perceptron *)
-let rec ft_core ~b = 
-  fun kij (labels: vec) (ais: vec) ->
-    let inc = ref Deque.empty in
-    let map = ref Map.empty in
-    let q = ref 0. in (* sum of all cap_psi so far *)
-    let m = ref 0 in
+let rec ft_core ~b kij (ais: vec) =
+  let inc = ref Deque.empty in
+  let map = ref Map.empty in
+  let q = ref 0. in (* sum of all cap_psi so far *)
+  let m = ref 0 in
+  fun (labels: vec) ->
+    let m0 = !m in
     let n = Array1.dim ais in
     (*    printf "ft(%d)%!" n; *)
     for i = 1 to n do
@@ -150,7 +153,8 @@ let rec ft_core ~b =
 	    ais.{i} <- 1.;
 	    q := !q +. cap_psi sr phi mu;
 	    inc := h; map := Map.remove r s;
-    done
+    done;
+    !m - m0
 
 let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
 let gen_kij_rbf two_sig_sq offsets =
@@ -204,9 +208,12 @@ let clean offs a =
 
 let kperceptron_offs (genk,tag_v) core ~loops offs labels_arr =
   let kij = genk offs in
-  let run_perc ls =
+  let run_perc labels =
     let ais = Vec.make0 (Array.length offs) in
-    for l = 1 to loops do core kij ls ais done;
+    let core = core kij ais in
+    let l = ref 0 in
+    let cutoff = Array.length offs / 20 in
+    while incr l; !l <= loops && core labels > cutoff  do () done;
     clean offs ais |> tag_v
   in  
   Array.map run_perc labels_arr
@@ -217,9 +224,12 @@ let kperceptron_slice gk core ~loops (off, len) labels_arr =
 
 let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   if Array1.dim labels <> Array.length offs then invalid_arg "Labels must have the same length as offs";
-  let kij = genk offs in
+  let (kij:matrix) = genk offs in
   let ais = Vec.make0 (Array.length offs) in
-  for l = 1 to loops do core kij labels ais done;
+  let core = core kij ais in
+  let l = ref 0 in
+  let cutoff = Array.length offs / 20 in
+  while incr l; !l <= loops && core labels > cutoff  do () done;
   clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
@@ -291,7 +301,7 @@ let rec search a ?(l=0) ?(u=Array.length a - 1) k =
     | 1 -> search a ~l:(m + 1) ~u k
     | _ -> 1. ;;
 
-let extend_one_one off len gen_classifier =
+let extend_one_one ?(cap=50000) (off, len) gen_classifier =
   printf "Training 1-1..\n%!";
   let t0 = Sys.time() in
   let grouped_data_by_category = Enum.foldi (fun i l acc -> Map.modify_def [] l (List.cons (i+off)) acc) (Map.create Int.compare) (Array1.enum train_labels |> Enum.skip (off-1) |> Enum.take len) in
@@ -301,7 +311,7 @@ let extend_one_one off len gen_classifier =
     |> Enum.flatten |> Array.of_enum 
   in
   let datapoints i j =
-    let get c = Map.find c gdc |> Array.enum in
+    let get c = Map.find c gdc |> Array.enum |> Enum.take cap in
     Enum.append (get i) (get j) |> Random.shuffle
   in
   let classes i data = let pos = Map.find i gdc in Array.map (search pos) data |> vec_of_arr in
@@ -440,15 +450,24 @@ let hedge experts (off, len) =
   let n = Array.length experts in
   let w = Array.create n 0. in
   let preds = Array.map predict_cat experts in
+  let votes = Array.create (category_count + 1) 0. in
+  let strs = Array.create n 0. in
+  let guesses = Array.create n 0 in
   for i = off to off+len-1 do
     let xi = get_i train_data i in
+    Array.fill votes 0 n 0.;
+    for i = 0 to n-1 do
+      let str,l = preds.(i) xi in
+      strs.(i) <- str; guesses.(i) <- l;
+      votes.(l) <- votes.(l) +. exp w.(i) *. str;
+    done;
+    let joint_prediction = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
     let yi = train_labels.{i} in
-    let test_expert j e = 
-      let str,pred_y = e xi in 
-      if str > 0.01 && pred_y <> yi then w.(j) <- w.(j) *. 0.8 ** str
-    in
-    Array.iteri test_expert preds;
+    if joint_prediction <> yi then
+      let test_expert j = if strs.(j) > 0.01 && guesses.(j) <> yi then w.(j) <- w.(j) -. strs.(j) in
+      for i = 0 to n-1 do test_expert i; done
   done;
+  printf "Hedge weights: e^%a\n" (Array.print print_float5) w;
   Hedge (experts, w)
 
 
@@ -542,10 +561,10 @@ let test_accuracy ?(n=10_000) name cpred =
   let right = 
     Array2.sub_right train_data off len 
   |> predict_many (predict_cat cpred)
-  |> Array.fold_lefti (fun acc i (_,l) -> if train_labels.{i} = l then acc+1 else acc) 0     
+  |> Array.fold_lefti (fun acc i (_,l) -> if train_labels.{i+1} = l then acc+1 else acc) 0     
   in
-  let accuracy = float right /. float n in
-  printf "%s Accuracy: %.2f (%.2fs)\n%!" name accuracy (Sys.time () -. t0);
+  let accuracy = 100. *. float right /. float n in
+  printf "%s Accuracy: %d of %d (%.2f%%) (%.2fs)\n%!" name right n accuracy (Sys.time () -. t0);
   accuracy
 
 let run_test ?(n = 10_000) name (cpred: cpredictor) = 
@@ -623,7 +642,10 @@ let test () =
     ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 4000) |> extend_hamm 50);
 *)
 
-  extend_one_one (train_rows / 2) (train_rows / 2) perceptron_b |> run_test "perb_D2_1-1" |> ignore;
+  extend_one_one (1,train_rows) perceptron_b |> run_test "perb_full_1-1" |> ignore;
+
+  kperceptron_elems (gt_rbf 0.1) (ft_core ~b:300) ~loops:100 |> extend_one_one ~cap:500 (1, train_rows) |> run_test "kprbf0.1_ft300_100loops_1-1cap500" |> ignore;
+
 
 (*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
