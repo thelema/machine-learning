@@ -15,14 +15,13 @@ let print_float5 oc x = fprintf oc "%.5f" x
 let debug = false
 let category_count = 164
 let top_n = 100
-let loops = 10
+
+let set_mhs n = Gc.set { (Gc.get()) with Gc.minor_heap_size = n; } 
+let () = set_mhs 1_000_000;;
 
 let train_data = Datafile.get_matrix "training.ba"
 let train_labels = Datafile.read_label_file "training_label.txt"
 let train_rows = Array1.dim train_labels
-
-let test_data = Datafile.get_matrix "development.txt.ba"
-let test_labels = Datafile.read_label_file "development_label.txt"
 
 let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
 
@@ -33,16 +32,17 @@ let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
 
 type bpredictor = 
   | Dot of float array (* weights of different features *)
-  | Dot_plus of float array * float
   | Kern_3 of int array * float array (* offsets of data used, ais*)
   | Kern_rbf of float * int array * float array (* sigma, offsets of data used, ais*)
   | Kern_pow of float * int array * float array (* exponent, offsets of data used, ais*)
+  | Dot_plus of float array * float
 
 type cpredictor = 
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
   | One_one of (int * int) array * bpredictor array (* i vs j pairs, with a predictor for each *)
   | Svm of string (* filename with serialized predictor *)
   | Hedge of cpredictor array * float array
+  | Pre_predicted of string (* filename with strength\tprediction lines *)
 
 (********************************************)
 (** Two-category learners *******************)
@@ -55,7 +55,7 @@ let perceptron (data: matrix) (labels: vec) =
   let acc = Vec.make0 Datafile.cols in
   let n = Array1.dim labels in
   for i = 1 to n do
-    let xi = Array2.slice_right data i in
+    let xi = get_i data i in
     let yi = labels.{i} in
     if dot xi w *. yi > 0. then incr right
     else axpy ~alpha:yi ~x:xi w;
@@ -76,7 +76,7 @@ let perceptron_b offsets (labels: vec) =
   printf "pb(%d)%!" n; 
   for ti = 1 to n do
     if ti land 0xfff = 0 then printf ".%!";
-    let xi = Array2.slice_right train_data offsets.(ti-1) in
+    let xi = get_i train_data offsets.(ti-1) in
     let yi = labels.{ti} in
     if !b +. dot xi w *. yi > 0. then incr right
     else (axpy ~alpha:yi ~x:xi w; b := !b +. 0.2 *. yi;);
@@ -119,17 +119,17 @@ let solve_phi sir mu q m =
   if p < 0. then failwith "negative phi";
   if p > 1. then 1. else p
 
-(* Implementation of a weak forgetron *)
-let rec ft_core b =  (* FIXME *)
-  let inc = ref Deque.empty in
-  let map = ref Map.empty in
-  let q = ref 0. in (* sum of all cap_psi so far *)
-  let m = ref 0 in
+(* Implementation of forgetron, a bounded memory perceptron *)
+let rec ft_core ~b = 
   fun kij (labels: vec) (ais: vec) ->
+    let inc = ref Deque.empty in
+    let map = ref Map.empty in
+    let q = ref 0. in (* sum of all cap_psi so far *)
+    let m = ref 0 in
     let n = Array1.dim ais in
-(*    printf "ft(%d)%!" n; *)
+    (*    printf "ft(%d)%!" n; *)
     for i = 1 to n do
-(*      if i land 0xfff = 0 then printf ".%!"; *)
+      (*      if i land 0xfff = 0 then printf ".%!"; *)
       let yi = labels.{i} in
       let mu_i = sparse_pred kij ais i 0. (Deque.to_list !inc) in
       if yi *. mu_i <= 0. then
@@ -152,7 +152,7 @@ let rec ft_core b =  (* FIXME *)
 	    inc := h; map := Map.remove r s;
     done
 
-let k_rbf two_s_sqr x1 x2 = let a = Vec.sqr_nrm2 (Vec.sub x1 x2) in exp (~-. a /. two_s_sqr)
+let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
 let gen_kij_rbf two_sig_sq offsets =
   let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
@@ -202,24 +202,24 @@ let clean offs a =
   printf "Support vectors: %d of %d\n%!" (Array.length a') (Array.length a);
   (a', offs')
 
-let kperceptron_offs (genk,tag_v) core t offs labels_arr =
+let kperceptron_offs (genk,tag_v) core ~loops offs labels_arr =
   let kij = genk offs in
   let run_perc ls =
     let ais = Vec.make0 (Array.length offs) in
-    for l = 1 to t do core kij ls ais done;
+    for l = 1 to loops do core kij ls ais done;
     clean offs ais |> tag_v
   in  
   Array.map run_perc labels_arr
 
-let kperceptron_slice gk core t (off, len) labels_arr =
+let kperceptron_slice gk core ~loops (off, len) labels_arr =
   let offs = (off --^ (off + len) |> Array.of_enum) in 
-  kperceptron_offs gk core t offs labels_arr
+  kperceptron_offs gk core ~loops offs labels_arr
 
-let kperceptron_elems (genk, tag_v) core t offs labels =
+let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   if Array1.dim labels <> Array.length offs then invalid_arg "Labels must have the same length as offs";
   let kij = genk offs in
   let ais = Vec.make0 (Array.length offs) in
-  for l = 1 to t do core kij labels ais done;
+  for l = 1 to loops do core kij labels ais done;
   clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
@@ -335,7 +335,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_3 x (Array2.slice_right train_data offs.(i-1)); 
+	t := !t +. ais.{i} *. k_3 x (get_i train_data offs.(i-1)); 
       done; 
       !t +. 0.)
   | Kern_rbf (sigma, offs, ais) -> 
@@ -344,7 +344,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_rbf sigma x (Array2.slice_right train_data offs.(i-1)); 
+	t := !t +. ais.{i} *. k_rbf sigma x (get_i train_data offs.(i-1)); 
       done; 
       !t +. 0.)
   | Kern_pow (p, offs, ais) -> 
@@ -353,7 +353,7 @@ let predict_b =
     (fun x -> 
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_pow p x (Array2.slice_right train_data offs.(i-1)); 
+	t := !t +. ais.{i} *. k_pow p x (get_i train_data offs.(i-1)); 
       done; 
       !t +. 0.)
 
@@ -378,7 +378,7 @@ let nearest_in label_map pred_lab =
 
 let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :: (to_bits (n-1) (x asr 1))
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
-let predict_many f d = Array.init (Array2.dim2 d) (fun i -> f (get_i d (i+1)))
+let predict_many f d = Array.init (Array2.dim2 d) (fun i -> if i land 0xfff = 0 then printf ".%!"; f (get_i d (i+1)))
 
 let rec predict_cat = function
   | Hamm (bpreds, cat_map) ->
@@ -414,7 +414,11 @@ let rec predict_cat = function
       votes.(winner) /. weight_sum, winner
     in
     (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
-
+  | Pre_predicted fn ->
+    let parse _ = assert false in
+    let ps = File.lines_of fn |> map parse |> Array.of_enum in
+    let i = ref 0 in
+    (fun _ -> let r = ps.(!i) in incr i; r)
 
 let rec print_cpred oc = function
   | Hamm (bps,cmap) -> fprintf oc "Hamm(%ax%d)" print_bpred bps.(0) (Array.length bps)
@@ -426,6 +430,7 @@ let rec print_cpred oc = function
       fprintf oc "%a,%.3f" print_cpred es.(i) ws.(i) 
     done;
     fprintf oc ")"
+  | Pre_predicted fn -> fprintf oc "PP(%s)" fn
 
 (***************************************)
 (** COMBINING MULTIPLE CPREDICTORS *****)
@@ -507,7 +512,7 @@ let print_pred_conf oc (conf, pred) =
 
 let print_cloned_head n ro ps = 
   let preds = Enum.clone ps |> Enum.take n |> Array.of_enum  in
-  let data = Array2.sub_right test_data ro n in
+  let data = Array2.sub_right train_data ro n in
   for i = 0 to n-1 do
     printf "Data:%a\npred:%a\n" 
       (Array.print print_float) (get_i data (i+1)|> Array1.to_array) 
@@ -527,13 +532,27 @@ let marshal_file fn_base x =
   Legacy.Marshal.to_channel oc x [];
   Pervasives.close_out oc
 
+
 let rand_slice ?(range=train_rows) len = (1+Random.int (range-len), len)
+
+let test_accuracy ?(n=10_000) name cpred =
+  marshal_file name cpred;
+  let t0 = Sys.time () in
+  let off,len = rand_slice ~range:(Array2.dim2 train_data) n in
+  let right = 
+    Array2.sub_right train_data off len 
+  |> predict_many (predict_cat cpred)
+  |> Array.fold_lefti (fun acc i (_,l) -> if train_labels.{i} = l then acc+1 else acc) 0     
+  in
+  let accuracy = float right /. float n in
+  printf "%s Accuracy: %.2f (%.2fs)\n%!" name accuracy (Sys.time () -. t0);
+  accuracy
 
 let run_test ?(n = 10_000) name (cpred: cpredictor) = 
   marshal_file name cpred;
   let t0 = Sys.time () in
-  let off,len = rand_slice ~range:(Array2.dim2 test_data) n in
-  let eval = Array2.sub_right test_data off len |> predict_many (predict_cat cpred) |> Array.enum
+  let off,len = rand_slice ~range:(Array2.dim2 train_data) n in
+  let eval = Array2.sub_right train_data off len |> predict_many (predict_cat cpred) |> Array.enum
 (*  |> tap (print_cloned_head 10 rand_offset) *)
   |> best_predictions 
   |> tap (fun ps -> File.with_file_out ("bests/" ^ name ^ ".bests") (fun oc -> output_preds oc ps))
@@ -557,7 +576,7 @@ let slice_shuffle n slice_len =
   1--slices |> Random.shuffle |> Array.enum |> Enum.map (fun i -> i --^ (i+slice_len)) |> Enum.flatten |> Array.of_enum
 
 let predict p oc =
-  predict_many (predict_cat p) test_data |> Array.iter (print_pred_conf oc)
+  predict_many (predict_cat p) train_data |> Array.iter (print_pred_conf oc)
 
 let pred_read fn =
   let ic = Pervasives.open_in_bin fn in
@@ -605,6 +624,9 @@ let test () =
 *)
 
   extend_one_one (train_rows / 2) (train_rows / 2) perceptron_b |> run_test "perb_D2_1-1" |> ignore;
+
+(*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
+    ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
   
 
 
