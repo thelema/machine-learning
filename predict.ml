@@ -113,9 +113,9 @@ let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
   | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
 
 (* magical formula for phi *)
-let solve_phi sir mu q m = 
-  let a = sir *. sir -. 2. *. sir *. mu in
-  let b = 2. *. sir in
+let solve_phi sr mu q m = 
+  let a = sr *. sr -. 2. *. sr *. mu in
+  let b = 2. *. sr in
   let c = q -. (15. /. 32.) *. float m in
   let p = (-. b +. sqrt (b *. b -. 4. *. a *. c) ) /. (2. *. a) in
   if p < 0. then failwith "negative phi";
@@ -123,37 +123,42 @@ let solve_phi sir mu q m =
 
 (* Implementation of forgetron, a bounded memory perceptron *)
 let rec ft_core ~b kij (ais: vec) =
-  let inc = ref Deque.empty in
-  let map = ref Map.empty in
+  let n = Array1.dim ais in
+  let forget_queue = ref Deque.empty in
   let q = ref 0. in (* sum of all cap_psi so far *)
-  let m = ref 0 in
+  let m = ref 0 in 
+  printf "ft(%d)%!" n; 
   fun (labels: vec) ->
     let m0 = !m in
-    let n = Array1.dim ais in
-    (*    printf "ft(%d)%!" n; *)
     for i = 1 to n do
       (*      if i land 0xfff = 0 then printf ".%!"; *)
       let yi = labels.{i} in
-      let mu_i = sparse_pred kij ais i 0. (Deque.to_list !inc) in
-      if yi *. mu_i <= 0. then
-	let s = Map.add i mu_i !map in
-	let h = Deque.cons i !inc in
+      let active = Deque.to_list !forget_queue in
+      let mu_i = sparse_pred kij ais i 0. active in
+      if yi *. mu_i <= 0. then ( (* guessed wrong *)
 	incr m;
-	if Deque.size h <= b then (
+	if ais.{i} = 0. then ( (* i is not in queue *)
 	  ais.{i} <- 1.;
-	  inc := h; map := s;
-	) else match Deque.rear h with
-	  | None -> assert false
-	  | Some (h, r) ->
-	    let sr = ais.{r} in
-	    let mu = Map.find r s in
+	  forget_queue := Deque.cons i !forget_queue;
+	  while Deque.size !forget_queue > b do (* overflow *)
+	    (* r is oldest in queue, to be removed *)
+	    let fq, r = Option.get (Deque.rear !forget_queue) in
+	    (* the weight for the oldest *)
+	    let sr = ais.{r} in 
+	    (* the current prediction for that sample *)
+	    let mu = labels.{r} *. sparse_pred kij ais r 0. active in 
 	    let phi = solve_phi sr mu !q !m in 
 	    scal phi ais;
 	    ais.{r} <- 0.;
 	    ais.{i} <- 1.;
 	    q := !q +. cap_psi sr phi mu;
-	    inc := h; map := Map.remove r s;
+	    forget_queue := fq;
+	  done
+	) else (* i was in the queue, so no overflow possible*)
+	  ais.{i} <- 1.
+      )
     done;
+    printf "(q:%.2f, m:%d)" !q !m;
     !m - m0
 
 let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
@@ -199,14 +204,36 @@ let gen_kij_pow pow offsets =
   kij
 
 
-let clean offs a =
+let clean (offs: int array) (a: vec) =
   let a = Array1.to_array a in
-  let offs' = Array.filteri (fun i _ -> a.(i) <> 0.) offs in
-  let a' = Array.filter ((<>) 0.) a in
-  printf "Support vectors: %d of %d\n%!" (Array.length a') (Array.length a);
+  let n = Array.length offs in
+  (* Use a bitset to store which elements will be in the final array. *)
+  let bs = BatBitSet.create n in
+  for i = 0 to n-1 do
+    if a.(i) <> 0. then BatBitSet.set bs i
+  done;
+  (* Allocate the final array and copy elements into it. *)
+  let n' = BatBitSet.count bs in
+  let j = ref 0 in
+  let offs' = Array.init n'
+    (fun _ ->
+       (* Find the next set bit in the BitSet. *)
+       while not (BatBitSet.is_set bs !j) do incr j done;
+       let r = offs.(!j) in
+       incr j;
+       r) in
+  j := 0;
+  let a' = Array.init n' 
+    (fun _ ->
+       (* Find the next set bit in the BitSet. *)
+       while not (BatBitSet.is_set bs !j) do incr j done;
+       let r = a.(!j) in
+       incr j;
+       r) in
+  printf "(sv:%d) " (Array.length a');
   (a', offs')
 
-let kperceptron_offs (genk,tag_v) core ~loops offs labels_arr =
+let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> vec -> int) ~loops offs labels_arr =
   let kij = genk offs in
   let run_perc labels =
     let ais = Vec.make0 (Array.length offs) in
@@ -214,6 +241,7 @@ let kperceptron_offs (genk,tag_v) core ~loops offs labels_arr =
     let l = ref 0 in
     let cutoff = Array.length offs / 20 in
     while incr l; !l <= loops && core labels > cutoff  do () done;
+    if !l > loops then printf "F" else printf "%d" !l; 
     clean offs ais |> tag_v
   in  
   Array.map run_perc labels_arr
@@ -223,13 +251,15 @@ let kperceptron_slice gk core ~loops (off, len) labels_arr =
   kperceptron_offs gk core ~loops offs labels_arr
 
 let kperceptron_elems (genk, tag_v) core ~loops offs labels =
-  if Array1.dim labels <> Array.length offs then invalid_arg "Labels must have the same length as offs";
+  let n = Array.length offs in
+  if Array1.dim labels <> n then invalid_arg "Labels must have the same length as offs";
   let (kij:matrix) = genk offs in
-  let ais = Vec.make0 (Array.length offs) in
+  let ais = Vec.make0 n in
   let core = core kij ais in
   let l = ref 0 in
-  let cutoff = Array.length offs / 20 in
+  let cutoff = n / 40 in
   while incr l; !l <= loops && core labels > cutoff  do () done;
+  if !l > loops then printf "F" else printf "%d" !l; 
   clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
@@ -311,7 +341,7 @@ let extend_one_one ?(cap=50000) (off, len) gen_classifier =
     |> Enum.flatten |> Array.of_enum 
   in
   let datapoints i j =
-    let get c = Map.find c gdc |> Array.enum |> Enum.take cap in
+    let get c = Map.find c gdc |> Array.enum |> Random.shuffle |> Array.enum |> Enum.take cap in
     Enum.append (get i) (get j) |> Random.shuffle
   in
   let classes i data = let pos = Map.find i gdc in Array.map (search pos) data |> vec_of_arr in
@@ -642,10 +672,15 @@ let test () =
     ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 4000) |> extend_hamm 50);
 *)
 
-  extend_one_one (1,train_rows) perceptron_b |> run_test "perb_full_1-1" |> ignore;
+(*  extend_one_one (1,train_rows) perceptron_b ~cap:500 |> run_test "perb_full_1-1" |> ignore; *)
 
+  kperceptron_elems (gt_rbf 0.1) (ft_core ~b:20) ~loops:50 
+  |> extend_one_one (1, train_rows) ~cap:750 
+  |> run_test "kprbf0..1_ft100_50loops_1-1cap750" |> ignore;
+
+(*
   kperceptron_elems (gt_rbf 0.1) (ft_core ~b:300) ~loops:100 |> extend_one_one ~cap:500 (1, train_rows) |> run_test "kprbf0.1_ft300_100loops_1-1cap500" |> ignore;
-
+*)
 
 (*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
