@@ -361,25 +361,63 @@ let rec search a ?(l=0) ?(u=Array.length a - 1) k =
     | 1 -> search a ~l:(m + 1) ~u k
     | _ -> 1. ;;
 
-let extend_one_one ?(cap=50000) (off, len) gen_classifier =
+(* group all datapoints in training set into categories, with max [cap] values in each group *)
+let group_by_cat ?(category_count=category_count) cap =
+  let cats = Array.create (category_count+1) Vect.empty in
+  let insert_random l i = 
+    let len = Vect.length cats.(l) in
+    let pos = Random.int (1+len) - 1 in
+    if pos = -1 then 
+      cats.(l) <- Vect.prepend i cats.(l) 
+    else if pos = len-1 then 
+      cats.(l) <- Vect.append i cats.(l)
+    else
+      cats.(l) <- Vect.insert pos (Vect.singleton i) cats.(l)
+  in
+  for i = 1 to train_rows do
+    let l = train_labels.{i} in 
+    if l < category_count then insert_random l i;
+  done;
+  let cap_slice v = 
+    Vect.to_array (if Vect.length v > cap then Vect.sub 0 cap v else v)
+  in
+  Array.map cap_slice cats
+
+let extend_one_one cats_a gen_classifier =
   printf "Training 1-1..\n%!";
+  let cap = Array.fold_left (fun acc a -> let l = Array.length a in if l > acc then l else acc) 0 cats_a in
   let t0 = Sys.time() in
-  let grouped_data_by_category = Enum.foldi (fun i l acc -> Map.modify_def [] l (List.cons (i+off)) acc) (Map.create Int.compare) (Array1.enum train_labels |> Enum.skip (off-1) |> Enum.take len) in
-  let gdc = Map.map (Array.of_list |- tap (Array.sort Int.compare)) grouped_data_by_category in
-  let category_pairs = 
-    Map.keys gdc |> map (fun i -> Map.keys gdc // (fun x -> x > i) /@ (fun j -> i,j)) 
-    |> Enum.flatten |> Array.of_enum 
-  in
-  let datapoints i j =
-    let get c = Map.find c gdc |> Array.enum |> Random.shuffle |> Array.enum |> Enum.take cap in
-    Enum.append (get i) (get j) |> Random.shuffle
-  in
-  let classes i data = let pos = Map.find i gdc in Array.map (search pos) data |> vec_of_arr in
-  let make_classifier (i,j) = let data = datapoints i j in gen_classifier data (classes i data) in
-  let ps = Array.map make_classifier category_pairs in
+  let cat_pairs = ref Vect.empty in
+  let ps = ref Vect.empty in
+  let common_buf = Array.create (cap * 2) 0 in
+  let common_label = Array.create (cap * 2) 0. in
+  for i = 1 to category_count do
+    for j = i+1 to category_count do
+      let ilen = Array.length cats_a.(i) in
+      let jlen = Array.length cats_a.(j) in
+      let data, labels = 
+	if ilen + jlen = cap * 2 then ( (* use common buf *)
+	  Array.blit cats_a.(i) 0 common_buf 0 ilen;
+	  Array.blit cats_a.(j) 0 common_buf ilen jlen;
+	  Array.fill common_label 0 ilen (1.);
+	  Array.fill common_label ilen jlen (-1.);
+	  common_buf, common_label
+	) else (
+	  Array.append cats_a.(i) cats_a.(j), 
+	  Array.init (ilen + jlen) (fun i -> if i < ilen then 1. else -1.)
+	) in
+      let t1 = Unix.gettimeofday () in
+      let cij = gen_classifier data (vec_of_arr labels) in
+      let t2 = Unix.gettimeofday () in
+      printf "gen:%.2f\t" (t2-.t1);
+      ps := Vect.append cij !ps;
+      cat_pairs := Vect.append (i,j) !cat_pairs;
+    done
+  done;
+  let category_pairs = Vect.to_array !cat_pairs in
+  let ps = Vect.to_array !ps in
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
   One_one (category_pairs, ps)
-
 
 (***************************************)
 (***********     SVM      **************)
@@ -614,6 +652,10 @@ let marshal_file fn_base x =
 
 let rand_slice ?(range=train_rows) len = (1+Random.int (range-len), len)
 
+let grouped_slice len = 
+  let per_group = len / category_count + 1 in
+  group_by_cat per_group |> Array.to_list |> Array.concat
+
 let test_accuracy ?(n=10_000) name cpred =
   marshal_file name cpred;
   let t0 = Sys.time () in
@@ -650,6 +692,40 @@ let crossval_int ~n ~f ~xs =
   let test x = f x |> run_test ("crossvalidate:" ^ string_of_int x) in
     List.iter (avg ~n test |- printf "Avg: %f") xs
 
+let cv_one_one cats stringify ~loops ~f ~xs =
+  let ca = 1 + Random.int category_count in
+  let cb = 1 + Random.int category_count in
+
+  let alen = Array.length cats.(ca) in
+  let blen = Array.length cats.(cb) in
+  printf "CV 1-1 cats %d(%d) and %d(%d)..\n%!" ca alen cb blen;
+  let splita = alen * 4 / 5 in
+  let cata, (testa: vec array) = 
+    Array.sub cats.(ca) 0 splita,
+    Array.sub cats.(ca) splita (alen - splita) |> Array.map (get_i train_data) in
+  let splitb = blen * 4 / 5 in
+  let catb, testb = 
+    Array.sub cats.(cb) 0 splitb, 
+    Array.sub cats.(cb) splitb (blen - splitb) |> Array.map (get_i train_data) in
+  let test_count = Array.length testa + Array.length testb in
+  let data = Array.append cata catb in
+  let labels = Array.init (Array.length data) (fun i -> if i < Array.length cata then 1. else -1.) in
+  List.iter (fun x -> 
+    printf "x=%s " (stringify x);
+    let run_test () = 
+      let p = f x data (vec_of_arr labels) |> predict_b in
+      let wrong_a = ref 0 in
+      Array.iter (fun x -> if p x <= 0. then incr wrong_a) testa;
+      let wrong_b = ref 0 in
+      Array.iter (fun x -> if p x >= 0. then incr wrong_b) testb;
+      float (!wrong_a + !wrong_b) /. float test_count
+    in
+    let t1 = Sys.time () in
+    let avg_wrong = avg ~n:loops run_test () in
+    let t2 = Sys.time () in
+    printf "Acc: %.1f%% in %.2fs\n%!" (100. *. (1. -. avg_wrong)) ((t2 -. t1) /. float loops);
+  ) xs
+
 let slice_shuffle n slice_len = 
   let slices = n / slice_len in
   1--slices |> Random.shuffle |> Array.enum |> Enum.map (fun i -> i --^ (i+slice_len)) |> Enum.flatten |> Array.of_enum
@@ -669,13 +745,16 @@ let pred_read fn =
 (***************************************)
 
 let train () = 
-  Random.self_init ();
 (*  kperceptron3_slice 1 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k"; *)
 (*  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k"); *)
 (* DONE  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k"; *)
 (* DONE  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k") *)
 (* DONE  Array.init train_rows (fun i -> i+1) |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" |> ignore; *)
-  slice_shuffle train_rows 2048 |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" ~n:100_000 |> ignore
+ kperceptron_elems (gt_rbf 0.5) (ft_core ~b:10) ~loops:100 
+  |> extend_one_one (group_by_cat 750)
+  |> run_test "kprbf.7.1_ft10_40loops_1-1cap500" |> ignore
+
+(*  slice_shuffle train_rows 2048 |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" ~n:100_000 |> ignore *)
 
 let predict_scan () = ()
   (* scan for *.pred files, move them to *.pred_act, create a *.output file and write predictions there *)
@@ -687,14 +766,15 @@ let test () =
      let rand_offset = Random.int (Array2.dim2 train_data - i) in
      kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
   *)
-(*
+
+
   crossval_int ~n:3 ~xs:(8--31 |> List.of_enum)
-    ~f:(fun i -> kperceptron_slice (gt_rbf 0.1) kp_core 1000 (rand_slice 2000) |> extend_hamm i);
+    ~f:(fun i -> kperceptron_offs (gt_rbf 0.3) (ft_core ~b:150) ~loops:100 (grouped_slice 10000) |> extend_hamm i);
 
   
   (*kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1"; *)
 
-  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
+(*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 2000) |> extend_hamm 50);
 
 
@@ -704,10 +784,24 @@ let test () =
 
 (*  extend_one_one (1,train_rows) perceptron_b ~cap:500 |> run_test "perb_full_1-1" |> ignore; *)
 
-  kperceptron_elems (gt_rbf 0.1) (ft_core ~b:20) ~loops:50 
-  |> extend_one_one (1, train_rows) ~cap:750 
-  |> run_test "kprbf0..1_ft100_50loops_1-1cap750" |> ignore;
 
+
+(* SEARCH FOR PARAMETERS *)
+(* find the best sigma (0.3-1.0 is good)
+  cv_one_one ~cap:500 string_of_float ~loops:5
+    ~xs:[0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:50) ~loops:250);
+ *)
+(* find a good bound for forgetron memory (10 is enough) 
+  cv_one_one ~cap:500 string_of_int ~loops:5
+    ~xs:[2; 4; 6; 8; 10; 15; 20; 25; 30; 35; 40; 50] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:n) ~loops:250); *)
+
+(* Find a good number of perceptron iterations (40 passes costs no more time than one pass, it seems)
+  cv_one_one ~cap:500 string_of_int ~loops:5
+    ~xs:[1; 4; 10; 40; 100; 250; 500; 1000; 2500; 4000; 10000]
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:50) ~loops:n);
+ *)
 (*
   kperceptron_elems (gt_rbf 0.1) (ft_core ~b:300) ~loops:100 |> extend_one_one ~cap:500 (1, train_rows) |> run_test "kprbf0.1_ft300_100loops_1-1cap500" |> ignore;
 *)
@@ -715,10 +809,5 @@ let test () =
 (*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
   
-
-
-  
-()
-
 (*  pred_read "kp3_0_2k.pred" |> run_test "kp3_0_2k" *)
     
