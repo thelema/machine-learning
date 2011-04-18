@@ -36,6 +36,7 @@ type bpredictor =
   | Kern_rbf of float * int array * float array (* sigma, offsets of data used, ais*)
   | Kern_pow of float * int array * float array (* exponent, offsets of data used, ais*)
   | Dot_plus of float array * float
+  | Notest
 
 type cpredictor = 
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
@@ -288,34 +289,44 @@ let gen_kij_pow pow offsets =
   kij
 
 
-let clean (offs: int array) (a: vec) =
-  let a = Array1.to_array a in
-  let n = Array.length offs in
+let clean2 pred_a a b =
+  let n = Array.length a in
   (* Use a bitset to store which elements will be in the final array. *)
   let bs = BatBitSet.create n in
   for i = 0 to n-1 do
-    if a.(i) <> 0. then BatBitSet.set bs i
+    if pred_a a.(i) then BatBitSet.set bs i
   done;
   (* Allocate the final array and copy elements into it. *)
-  let n' = BatBitSet.count bs in
+  let new_len = BatBitSet.count bs in
   let j = ref 0 in
-  let offs' = Array.init n'
-    (fun _ ->
-       (* Find the next set bit in the BitSet. *)
-       while not (BatBitSet.is_set bs !j) do incr j done;
-       let r = offs.(!j) in
-       incr j;
-       r) in
-  j := 0;
-  let a' = Array.init n' 
+  let filtered_a = Array.init new_len
     (fun _ ->
        (* Find the next set bit in the BitSet. *)
        while not (BatBitSet.is_set bs !j) do incr j done;
        let r = a.(!j) in
        incr j;
        r) in
-  printf "(sv:%d) %!" (Array.length a');
-  (a', offs')
+  j := 0;
+  let filtered_b = Array.init new_len
+    (fun _ ->
+       (* Find the next set bit in the BitSet. *)
+       while not (BatBitSet.is_set bs !j) do incr j done;
+       let r = b.(!j) in
+       incr j;
+       r) in
+  printf "(%d) %!" new_len;
+  (filtered_a, filtered_b)
+
+let clean (offs: int array) a =
+  let a = Array1.to_array (a: vec) in
+  clean2 (fun a -> a <> 0.) a offs
+
+let kernel_lsq kij labels =
+  let labels = vec_of_arr labels in
+  (* (kij + lambda I)^{-1} y *)
+  ()
+
+let simplify _ = assert false
 
 let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> float array -> int) ~loops offs labels_arr =
   let n = Array.length offs in
@@ -324,13 +335,13 @@ let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> float array -> int) ~l
     let ais = Vec.make0 (Array.length offs) in
     let core = core kij ais in
     let l = ref 0 in
-    let cutoff = n / 40 in
+    let cutoff = n / 10 in
     let wrongs = ref n in
     while !l < loops && !wrongs > cutoff do 
       incr l; wrongs := core labels 
     done;
-    if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
-    clean offs ais |> tag_v
+    if !l >= loops then (printf "F%d" !wrongs; Notest (*(kernel_lsq kij labels |> simplify |> tag_v)*)) 
+    else (printf "%d" !l; clean offs ais |> tag_v)
   in  
   Array.map run_perc labels_arr
 
@@ -345,13 +356,13 @@ let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   let ais = Vec.make0 n in
   let core = core kij ais in
   let l = ref 0 in
-  let cutoff = n / 40 in
+  let cutoff = n / 10 in
   let wrongs = ref n in
   while !l < loops && !wrongs > cutoff do 
     incr l; wrongs := core labels 
   done;
-  if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
-  clean offs ais |> tag_v
+  if !l >= loops then (printf "F%d" !wrongs; Notest) 
+  else (printf "%d" !l; clean offs ais |> tag_v)
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
 let gt_rbf sigma = (gen_kij_rbf sigma, fun (a,o) -> Kern_rbf(sigma,o,a))
@@ -413,7 +424,7 @@ let extend_hamm cat_bits gen_classifier =
   let {get = map_cat; enum=cat_mapping} = 
     make_map (fun _ -> Random.full_range () land mask) in
   let bit_labels i x = if ((map_cat x) asr i) land 1 = 1 then 1. else -1. in
-  let gen_labels i = Array.init n (fun j -> bit_labels i train_labels.{j}) in
+  let gen_labels i = Array.init n (fun j -> bit_labels i train_labels.{j+1}) in
   printf ".%!";
   let all_labels = Array.init cat_bits gen_labels in
   printf ".%!";
@@ -482,7 +493,8 @@ let extend_one_one cats_a gen_classifier =
   let category_pairs = Vect.to_array !cat_pairs in
   let ps = Vect.to_array !ps in
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
-  One_one (category_pairs, ps)
+  let bpreds, pairs = clean2 ((<>) Notest) ps category_pairs in  
+  One_one (pairs, bpreds)
 
 (***************************************)
 (***********     SVM      **************)
@@ -529,6 +541,7 @@ let predict_b =
 	t := !t +. ais.{i} *. k_pow p x (get_i train_data offs.(i-1)); 
       done; 
       !t +. 0.)
+  | Notest -> (fun x -> 0.)
 
 let print_bpred oc = function
   | Dot w -> Array.length w |> fprintf oc "Dot(%d)"
@@ -536,6 +549,7 @@ let print_bpred oc = function
   | Kern_3 (o,a) -> fprintf oc "K3(%d)" (Array.length o)
   | Kern_rbf (s,o,a) -> fprintf oc "RBF%.2f(%d)" s (Array.length o)
   | Kern_pow (p,o,a) -> fprintf oc "K%.1f(%d)" p (Array.length o)
+  | Notest -> fprintf oc "NT"
 
 let get_heads enum_l = 
   Array.fold_left (fun acc x -> match Enum.get x with 
@@ -819,9 +833,14 @@ let train () =
 (* DONE  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k"; *)
 (* DONE  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k") *)
 (* DONE  Array.init train_rows (fun i -> i+1) |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" |> ignore; *)
+(*
  kperceptron_elems (gt_rbf 0.4) (ft_core ~b:200 ~b0:20) ~loops:100 
   |> extend_one_one (group_by_cat 750)
   |> run_test "kprbf.4_ft200_100loops_1-1cap500" |> ignore
+*)
+  kperceptron_offs (gt_rbf 0.4) (ft_core ~b:400) ~loops:500 (grouped_slice 20000)
+  |> extend_hamm 60
+  |> run_test "kprbf.4_ft400_50loops_hamm60" |> ignore
 
 (*  slice_shuffle train_rows 2048 |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" ~n:100_000 |> ignore *)
 
@@ -856,42 +875,13 @@ let test () =
   cv_one_one (group_by_cat 1250) string_of_float ~loops:5
     ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
     ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
-  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
-    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
-  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
-    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
-  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
-    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
-  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
-    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
 
 (* find a good bound for forgetron memory (10 is enough)  *)
 (*
   cv_one_one (group_by_cat 625) string_of_int ~loops:5
     ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
     ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
 *)
-
 (* Find a good number of perceptron iterations (40 passes costs no more time than one pass, it seems)
   cv_one_one ~cap:500 string_of_int ~loops:5
     ~xs:[1; 4; 10; 40; 100; 250; 500; 1000; 2500; 4000; 10000]
