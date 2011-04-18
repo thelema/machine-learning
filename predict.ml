@@ -137,16 +137,19 @@ let shuffle a =
 
 
   (* Implementation of forgetron, a bounded memory perceptron *)
-let rec ft_core ~b (kij: matrix) (ais: vec) =
+let rec ft_core ~b ?(b0=10) (kij: matrix) (ais: vec) =
   let n = Array1.dim ais in
   let forget_queue = ref Deque.empty in
   let q = ref 0. in (* sum of all cap_psi so far *)
   let m = ref 0 in (* total mistakes *)
+  let bincr = 10 in
+  let bnow = ref (b0 - bincr) in
   printf "ft(%d)%!" n; 
   let process_order = Array.init n (fun i -> i+1) in
   fun (labels: vec) ->
     let m0 = !m in
     shuffle process_order;
+    bnow := min b (!bnow + bincr);
     for i = 0 to n-1 do
       let i = process_order.(i) in
       (*      if i land 0xfff = 0 then printf ".%!"; *)
@@ -156,7 +159,7 @@ let rec ft_core ~b (kij: matrix) (ais: vec) =
 	if ais.{i} = 0. then ( (* i is not in queue *)
 	  (* put i in the queue *)
 	  forget_queue := Deque.cons i !forget_queue;
-	  if Deque.size !forget_queue > b then (* overflow *)
+	  if Deque.size !forget_queue > !bnow then (* overflow *)
 	    (* r is oldest in queue, will be removed *)
 	    let fq, r = Option.get (Deque.rear !forget_queue) in
 	    forget_queue := fq;
@@ -351,15 +354,6 @@ let extend_hamm cat_bits gen_classifier =
   let classifiers = gen_classifier all_labels in
   printf "Done training (%.2fs)\n%!" (Sys.time () -. t0);
   Hamm (classifiers, cat_map)
-
-(* binary search, returning +1. on found and -1. on not found *)
-let rec search a ?(l=0) ?(u=Array.length a - 1) k =
-    if l > u then -1. else
-    let m = l + (u - l) / 2 in
-    match compare k a.(m) with
-    | -1 -> search a ~l ~u:(m - 1) k
-    | 1 -> search a ~l:(m + 1) ~u k
-    | _ -> 1. ;;
 
 (* group all datapoints in training set into categories, with max [cap] values in each group *)
 let group_by_cat ?(category_count=category_count) cap =
@@ -754,7 +748,7 @@ let train () =
 (* DONE  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k"; *)
 (* DONE  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k") *)
 (* DONE  Array.init train_rows (fun i -> i+1) |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" |> ignore; *)
- kperceptron_elems (gt_rbf 0.5) (ft_core ~b:10) ~loops:100 
+ kperceptron_elems (gt_rbf 0.5) (ft_core ~b:200 ~b0:20) ~loops:100 
   |> extend_one_one (group_by_cat 750)
   |> run_test "kprbf.7.1_ft10_40loops_1-1cap500" |> ignore
 
@@ -771,11 +765,7 @@ let test () =
      kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
   *)
 
-
-  crossval_int ~n:3 ~xs:(8--31 |> List.of_enum)
-    ~f:(fun i -> kperceptron_offs (gt_rbf 0.3) (ft_core ~b:150) ~loops:100 (grouped_slice 10000) |> extend_hamm i);
-
-  
+ 
   (*kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1"; *)
 
 (*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
@@ -791,15 +781,45 @@ let test () =
 
 
 (* SEARCH FOR PARAMETERS *)
-(* find the best sigma (0.3-1.0 is good)
-  cv_one_one ~cap:500 string_of_float ~loops:5
-    ~xs:[0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:50) ~loops:250);
- *)
-(* find a good bound for forgetron memory (10 is enough) 
-  cv_one_one ~cap:500 string_of_int ~loops:5
-    ~xs:[2; 4; 6; 8; 10; 15; 20; 25; 30; 35; 40; 50] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:n) ~loops:250); *)
+(* find the best sigma (0.3-1.0 is good) *)
+  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
+    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
+  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
+    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
+  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
+    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
+  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
+    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
+  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
+    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
+    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
+
+(* find a good bound for forgetron memory (10 is enough)  *)
+(*
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+  cv_one_one (group_by_cat 625) string_of_int ~loops:5
+    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
+    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
+*)
 
 (* Find a good number of perceptron iterations (40 passes costs no more time than one pass, it seems)
   cv_one_one ~cap:500 string_of_int ~loops:5
@@ -812,6 +832,8 @@ let test () =
 
 (*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
     ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
-  
-(*  pred_read "kp3_0_2k.pred" |> run_test "kp3_0_2k" *)
+
+
+  crossval_int ~n:3 ~xs:(8--31 |> List.of_enum)
+    ~f:(fun i -> kperceptron_offs (gt_rbf 0.3) (ft_core ~b:150 ~b0:10) ~loops:100 (grouped_slice 10000) |> extend_hamm i);
     
