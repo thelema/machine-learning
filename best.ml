@@ -10,7 +10,7 @@ let () =
   let outall = infile ^ ".all" in
   let outbest = infile ^ ".best" in
   let predictor = pred_read infile |> predict_cat in
-  printf "Predicting...%!";
+  printf "Predicting%!";
   let t0 = Sys.time() in
   let n = if Array.length Sys.argv > 2 then int_of_string Sys.argv.(2) else -1 in
   let test_data = if n = -1 then test_data else Array2.sub_right test_data 1 n in

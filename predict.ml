@@ -486,7 +486,11 @@ let nearest_in label_map pred_lab =
 
 let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :: (to_bits (n-1) (x asr 1))
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
-let predict_many f d = Array.init (Array2.dim2 d) (fun i -> if i land 0xfff = 0 then printf ".%!"; f (get_i d (i+1)))
+let predict_many f d = 
+  let t0 = Unix.gettimeofday () in 
+  let r = Array.init (Array2.dim2 d) (fun i -> if i land 0xfff = 0 then printf ".%!"; f (get_i d (i+1))) in
+  printf "%.0f/s" (float (Array2.dim2 d) /. (Unix.gettimeofday () -. t0));
+  r
 
 let rec predict_cat = function
   | Hamm (bpreds, cat_map) ->
