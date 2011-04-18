@@ -183,6 +183,64 @@ let rec ft_core ~b ?(b0=10) (kij: matrix) (ais: vec) =
     done;
     (*    printf "(q:%.2f, m:%d)" !q !m; *)
     !m - m0 (* the number of mistakes this loop *)
+
+
+(* Implementation of forgetron, a bounded memory perceptron *)
+(* this version doesn't use a gram matrix, but computes the kernel on the fly *)
+let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) (ais: vec) =
+  let n = Array1.dim ais in
+  let forget_queue = ref Deque.empty in
+  let q = ref 0. in (* sum of all cap_psi so far *)
+  let m = ref 0 in (* total mistakes *)
+  let bincr = 10 in
+  let bnow = ref (b0 - bincr) in
+  printf "ft(%d)%!" n; 
+  let f x = 
+    let acc = ref 0. in 
+    for i = 1 to n do 
+      if ais.{i} <> 0. then 
+	acc := !acc +. ais.{i} *. k (get_i train_data offsets.(i)) x
+    done;
+    !acc +. 0.
+  in
+  let process_order = Array.init n (fun i -> i+1) in
+  fun (labels: vec) ->
+    let m0 = !m in
+    shuffle process_order;
+    bnow := min b (!bnow + bincr);
+    for i = 0 to n-1 do
+      let i = process_order.(i) in (* 0..n-1 -> 1..n *)
+      (*      if i land 0xfff = 0 then printf ".%!"; *)
+      let yi = labels.{i} in
+      let mu_i = f (get_i train_data offsets.(i)) in
+      if yi *. mu_i <= 0. then ( (* guessed wrong or no guess *)
+	if ais.{i} = 0. then ( (* i is not in queue *)
+	  (* put i in the queue *)
+	  forget_queue := Deque.cons i !forget_queue;
+	  if Deque.size !forget_queue > !bnow then (* overflow *)
+	    (* r is oldest in queue, will be removed *)
+	    let fq, r = Option.get (Deque.rear !forget_queue) in
+	    forget_queue := fq;
+	    (* the weight for the oldest *)
+	    let sr = abs_float ais.{r} in 
+	    ais.{i} <- yi; (* add i to ais *)
+	    (* the current prediction for x_r *)
+	    let mu = labels.{r} *. f (get_i train_data r) in 
+	    ais.{r} <- 0.; (* remove r from ais *)
+	    let phi = solve_phi sr mu !q !m in  (* optimal phi *)
+	    if phi <= 0. then failwith "negative phi";
+	    if phi < 1. then (
+	      scal phi ais; (* scale ais down by phi *)
+	      q := !q +. cap_psi sr phi mu; (* accumulate q *)
+	    ) else (* don't scale, cap phi at 1.0 *)
+	      q := !q +. cap_psi sr 1.0 mu; (* accumulate q *)
+	);
+	incr m;
+	ais.{i} <- yi (* no matter what, include i *)
+      )
+    done;
+    (*    printf "(q:%.2f, m:%d)" !q !m; *)
+    !m - m0 (* the number of mistakes this loop *)
 	
 let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
 let gen_kij_rbf two_sig_sq offsets =
@@ -299,6 +357,23 @@ let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
 let gt_rbf sigma = (gen_kij_rbf sigma, fun (a,o) -> Kern_rbf(sigma,o,a))
 let gt_pow p = (gen_kij_pow p, fun (a,o) -> Kern_pow (p, o, a))
 
+let kt_rbf sigma = (k_rbf sigma, fun (a,o) -> Kern_rbf(sigma, o, a))
+
+let kperceptron_onfly (k, tag_v) core_fly ~loops offs labels =
+  let n = Array.length offs in
+  if Array1.dim labels <> n then invalid_arg "Labels must have the same length as offs";
+  let ais = Vec.make0 n in
+  let core = core_fly k ais in
+  let l = ref 0 in
+  let cutoff = n / 40 in
+  let wrongs = ref n in
+  while !l < loops && !wrongs > cutoff do 
+    incr l; wrongs := core labels 
+  done;
+  if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
+  clean offs ais |> tag_v
+
+  
 (*
 let () = printf "Reading..%!"
 let t0 = Sys.time()
