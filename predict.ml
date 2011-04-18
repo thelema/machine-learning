@@ -17,7 +17,7 @@ let category_count = 164
 let top_n = 100
 
 let set_mhs n = Gc.set { (Gc.get()) with Gc.minor_heap_size = n; } 
-let () = set_mhs 1_000_000;;
+let () = set_mhs 1_000_000; Random.self_init ();;
 
 let train_data = Datafile.get_matrix "training.ba"
 let train_labels = Datafile.read_label_file "training_label.txt"
@@ -108,59 +108,79 @@ let kp_core kij (ais: vec) (labels: vec) =
 
 let cap_psi sr phi mu = (sr *. phi) *. (sr *. phi) +. 2. *. sr *. phi *. (1. -. phi *. mu)
 
-let rec sparse_pred (kij: matrix) (ais: vec) i acc = function
-  | [] -> acc
-  | j::t -> sparse_pred kij ais i (ais.{j} *. kij.{j,i} +. acc) t
+(*
+let rec sparse_pred_aux (kij: matrix) (ais: vec) i acc j = 
+  if ais.(j) = 0. then sparse_pred_aux kij ais i acc (j+1) 
+  else sparse_pred_aux kij ais i (ais.{j} *. kij.{j,i} +. acc) t
+ *)
 
 (* magical formula for phi *)
 let solve_phi sr mu q m = 
   let a = sr *. sr -. 2. *. sr *. mu in
   let b = 2. *. sr in
   let c = q -. (15. /. 32.) *. float m in
-  let p = (-. b +. sqrt (b *. b -. 4. *. a *. c) ) /. (2. *. a) in
-  if p < 0. then failwith "negative phi";
-  if p > 1. then 1. else p
+  if a = 0. then -.c /. b else 
+    (-. b +. sqrt (b *. b -. 4. *. a *. c) ) /. (2. *. a) 
 
-(* Implementation of forgetron, a bounded memory perceptron *)
-let rec ft_core ~b kij (ais: vec) =
+let rec nonzeros_at_least a lim i = 
+  if i >= Array.length a then false else
+  nonzeros_at_least a (if a.(i) = 0. then lim else lim-1) (i+1)
+
+let shuffle a = 
+  for n = Array.length a - 1 downto 1 do
+    let k    = Random.int ( n + 1 ) in
+    if k <> n then
+      let buf  = Array.get a n in
+      Array.set a n (Array.get a k);
+      Array.set a k buf;
+  done
+
+
+  (* Implementation of forgetron, a bounded memory perceptron *)
+let rec ft_core ~b (kij: matrix) (ais: vec) =
   let n = Array1.dim ais in
   let forget_queue = ref Deque.empty in
   let q = ref 0. in (* sum of all cap_psi so far *)
-  let m = ref 0 in 
+  let m = ref 0 in (* total mistakes *)
   printf "ft(%d)%!" n; 
+  let process_order = Array.init n (fun i -> i+1) in
   fun (labels: vec) ->
     let m0 = !m in
-    for i = 1 to n do
+    shuffle process_order;
+    for i = 0 to n-1 do
+      let i = process_order.(i) in
       (*      if i land 0xfff = 0 then printf ".%!"; *)
       let yi = labels.{i} in
-      let active = Deque.to_list !forget_queue in
-      let mu_i = sparse_pred kij ais i 0. active in
-      if yi *. mu_i <= 0. then ( (* guessed wrong *)
-	incr m;
+      let mu_i = dot (get_i kij i) ais in
+      if yi *. mu_i <= 0. then ( (* guessed wrong or no guess *)
 	if ais.{i} = 0. then ( (* i is not in queue *)
-	  ais.{i} <- 1.;
+	  (* put i in the queue *)
 	  forget_queue := Deque.cons i !forget_queue;
-	  while Deque.size !forget_queue > b do (* overflow *)
-	    (* r is oldest in queue, to be removed *)
+	  if Deque.size !forget_queue > b then (* overflow *)
+	    (* r is oldest in queue, will be removed *)
 	    let fq, r = Option.get (Deque.rear !forget_queue) in
-	    (* the weight for the oldest *)
-	    let sr = ais.{r} in 
-	    (* the current prediction for that sample *)
-	    let mu = labels.{r} *. sparse_pred kij ais r 0. active in 
-	    let phi = solve_phi sr mu !q !m in 
-	    scal phi ais;
-	    ais.{r} <- 0.;
-	    ais.{i} <- 1.;
-	    q := !q +. cap_psi sr phi mu;
 	    forget_queue := fq;
-	  done
-	) else (* i was in the queue, so no overflow possible*)
-	  ais.{i} <- 1.
+	    (* the weight for the oldest *)
+	    let sr = abs_float ais.{r} in 
+	    ais.{i} <- yi; (* add i to ais *)
+	    (* the current prediction for x_r *)
+	    let mu = labels.{r} *. dot (get_i kij r) ais in 
+	    ais.{r} <- 0.; (* remove r from ais *)
+	    let phi = solve_phi sr mu !q !m in  (* optimal phi *)
+	    if phi <= 0. then failwith "negative phi";
+	    if phi < 1. then (
+	      scal phi ais; (* scale ais down by phi *)
+	      q := !q +. cap_psi sr phi mu; (* accumulate q *)
+	    ) else (* don't scale, cap phi at 1.0 *)
+	      q := !q +. cap_psi sr 1.0 mu; (* accumulate q *)
+	);
+	incr m;
+	ais.{i} <- yi (* no matter what, include i *)
       )
     done;
-    printf "(q:%.2f, m:%d)" !q !m;
-    !m - m0
-
+    (*    printf "(q:%.2f, m:%d)" !q !m; *)
+    !m - m0 (* the number of mistakes this loop *)
+	
 let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
 let gen_kij_rbf two_sig_sq offsets =
   let n = Array.length offsets in
