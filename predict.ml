@@ -188,8 +188,9 @@ let gen_kij_rbf two_sig_sq offsets =
 (*  printf "Generating kij(%dx%d) using rbf(x,y)...%!" n n; *)
   for i = 1 to n do
     let xi = (get_i train_data offsets.(i-1)) in
-    for j = 1 to n do
-      kij.{i,j} <- k_rbf two_sig_sq xi (get_i train_data offsets.(j-1))
+    for j = i to n do
+      let k = k_rbf two_sig_sq xi (get_i train_data offsets.(j-1)) in
+      kij.{i,j} <- k; kij.{j,i} <- k
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -202,8 +203,9 @@ let gen_kij_3 offsets =
 (*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
   for i = 1 to n do
     let xi = (get_i train_data offsets.(i-1)) in
-    for j = 1 to n do
-      kij.{j,i} <- k_3 xi (get_i train_data offsets.(j-1))
+    for j = i to n do
+      let k = k_3 xi (get_i train_data offsets.(j-1)) in
+      kij.{i,j} <- k; kij.{j,i} <- k
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -217,7 +219,8 @@ let gen_kij_pow pow offsets =
   for i = 1 to n do
     let xi = (get_i train_data offsets.(i-1)) in
     for j = 1 to n do
-      kij.{j,i} <- k_3 xi (get_i train_data offsets.(j-1))
+      let k = k_3 xi (get_i train_data offsets.(j-1)) in
+      kij.{i,j} <- k; kij.{j,i} <- k
     done;
   done;
 (*  printf "Done\n%!"; *)
@@ -250,18 +253,22 @@ let clean (offs: int array) (a: vec) =
        let r = a.(!j) in
        incr j;
        r) in
-  printf "(sv:%d) " (Array.length a');
+  printf "(sv:%d) %!" (Array.length a');
   (a', offs')
 
 let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> vec -> int) ~loops offs labels_arr =
+  let n = Array.length offs in
   let kij = genk offs in
   let run_perc labels =
     let ais = Vec.make0 (Array.length offs) in
     let core = core kij ais in
     let l = ref 0 in
-    let cutoff = Array.length offs / 20 in
-    while incr l; !l <= loops && core labels > cutoff  do () done;
-    if !l > loops then printf "F" else printf "%d" !l; 
+    let cutoff = n / 40 in
+    let wrongs = ref n in
+    while !l < loops && !wrongs > cutoff do 
+      incr l; wrongs := core labels 
+    done;
+    if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
     clean offs ais |> tag_v
   in  
   Array.map run_perc labels_arr
@@ -278,8 +285,11 @@ let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   let core = core kij ais in
   let l = ref 0 in
   let cutoff = n / 40 in
-  while incr l; !l <= loops && core labels > cutoff  do () done;
-  if !l > loops then printf "F" else printf "%d" !l; 
+  let wrongs = ref n in
+  while !l < loops && !wrongs > cutoff do 
+    incr l; wrongs := core labels 
+  done;
+  if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
   clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
