@@ -67,7 +67,7 @@ let perceptron (data: matrix) (labels: vec) =
   scal (1. /. float n) acc;
   Dot (Array1.to_array acc)
 
-let perceptron_b offsets (labels: vec) =
+let perceptron_b offsets labels =
   let w = Vec.make0 Datafile.cols in
   let b = ref 0. in
   let acc = Vec.make0 Datafile.cols in
@@ -77,7 +77,7 @@ let perceptron_b offsets (labels: vec) =
   for ti = 1 to n do
     if ti land 0xfff = 0 then printf ".%!";
     let xi = get_i train_data offsets.(ti-1) in
-    let yi = labels.{ti} in
+    let yi = labels.(ti-1) in
     if !b +. dot xi w *. yi > 0. then incr right
     else (axpy ~alpha:yi ~x:xi w; b := !b +. 0.2 *. yi;);
     let n2 = Vec.sqr_nrm2 w +. !b *. !b in
@@ -146,14 +146,14 @@ let rec ft_core ~b ?(b0=10) (kij: matrix) (ais: vec) =
   let bnow = ref (b0 - bincr) in
   printf "ft(%d)%!" n; 
   let process_order = Array.init n (fun i -> i+1) in
-  fun (labels: vec) ->
+  fun (labels: float array) ->
     let m0 = !m in
     shuffle process_order;
     bnow := min b (!bnow + bincr);
     for i = 0 to n-1 do
       let i = process_order.(i) in
       (*      if i land 0xfff = 0 then printf ".%!"; *)
-      let yi = labels.{i} in
+      let yi = labels.(i-1) in
       let mu_i = dot (get_i kij i) ais in
       if yi *. mu_i <= 0. then ( (* guessed wrong or no guess *)
 	if ais.{i} = 0. then ( (* i is not in queue *)
@@ -167,7 +167,7 @@ let rec ft_core ~b ?(b0=10) (kij: matrix) (ais: vec) =
 	    let sr = abs_float ais.{r} in 
 	    ais.{i} <- yi; (* add i to ais *)
 	    (* the current prediction for x_r *)
-	    let mu = labels.{r} *. dot (get_i kij r) ais in 
+	    let mu = labels.(r-1) *. dot (get_i kij r) ais in 
 	    ais.{r} <- 0.; (* remove r from ais *)
 	    let phi = solve_phi sr mu !q !m in  (* optimal phi *)
 	    if phi <= 0. then failwith "negative phi";
@@ -204,14 +204,14 @@ let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) 
     !acc +. 0.
   in
   let process_order = Array.init n (fun i -> i+1) in
-  fun (labels: vec) ->
+  fun (labels: float array) ->
     let m0 = !m in
     shuffle process_order;
     bnow := min b (!bnow + bincr);
     for i = 0 to n-1 do
       let i = process_order.(i) in (* 0..n-1 -> 1..n *)
       (*      if i land 0xfff = 0 then printf ".%!"; *)
-      let yi = labels.{i} in
+      let yi = labels.(i-1) in
       let mu_i = f (get_i train_data offsets.(i)) in
       if yi *. mu_i <= 0. then ( (* guessed wrong or no guess *)
 	if ais.{i} = 0. then ( (* i is not in queue *)
@@ -225,7 +225,7 @@ let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) 
 	    let sr = abs_float ais.{r} in 
 	    ais.{i} <- yi; (* add i to ais *)
 	    (* the current prediction for x_r *)
-	    let mu = labels.{r} *. f (get_i train_data r) in 
+	    let mu = labels.(r-1) *. f (get_i train_data r) in 
 	    ais.{r} <- 0.; (* remove r from ais *)
 	    let phi = solve_phi sr mu !q !m in  (* optimal phi *)
 	    if phi <= 0. then failwith "negative phi";
@@ -317,7 +317,7 @@ let clean (offs: int array) (a: vec) =
   printf "(sv:%d) %!" (Array.length a');
   (a', offs')
 
-let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> vec -> int) ~loops offs labels_arr =
+let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> float array -> int) ~loops offs labels_arr =
   let n = Array.length offs in
   let kij = genk offs in
   let run_perc labels =
@@ -340,7 +340,7 @@ let kperceptron_slice gk core ~loops (off, len) labels_arr =
 
 let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   let n = Array.length offs in
-  if Array1.dim labels <> n then invalid_arg "Labels must have the same length as offs";
+  if Array.length labels <> n then invalid_arg "Labels must have the same length as offs";
   let (kij:matrix) = genk offs in
   let ais = Vec.make0 n in
   let core = core kij ais in
@@ -361,7 +361,7 @@ let kt_rbf sigma = (k_rbf sigma, fun (a,o) -> Kern_rbf(sigma, o, a))
 
 let kperceptron_onfly (k, tag_v) core_fly ~loops offs labels =
   let n = Array.length offs in
-  if Array1.dim labels <> n then invalid_arg "Labels must have the same length as offs";
+  if Array.length labels <> n then invalid_arg "Labels must have the same length as offs";
   let ais = Vec.make0 n in
   let core = core_fly k ais in
   let l = ref 0 in
@@ -413,11 +413,7 @@ let extend_hamm cat_bits gen_classifier =
   let {get = map_cat; enum=cat_mapping} = 
     make_map (fun _ -> Random.full_range () land mask) in
   let bit_labels i x = if ((map_cat x) asr i) land 1 = 1 then 1. else -1. in
-  let gen_labels i = 
-    let ls = Vec.make0 n in 
-    for j = 1 to n do ls.{j} <- bit_labels i train_labels.{j} done; 
-    ls 
-  in
+  let gen_labels i = Array.init n (fun j -> bit_labels i train_labels.{j}) in
   printf ".%!";
   let all_labels = Array.init cat_bits gen_labels in
   printf ".%!";
@@ -476,7 +472,7 @@ let extend_one_one cats_a gen_classifier =
 	  Array.init (ilen + jlen) (fun i -> if i < ilen then 1. else -1.)
 	) in
       let t1 = Unix.gettimeofday () in
-      let cij = gen_classifier data (vec_of_arr labels) in
+      let cij = gen_classifier data labels in
       let t2 = Unix.gettimeofday () in
       printf "gen:%.2f\t" (t2-.t1);
       ps := Vect.append cij !ps;
@@ -786,7 +782,7 @@ let cv_one_one cats stringify ~loops ~f ~xs =
   List.iter (fun x -> 
     printf "x=%s " (stringify x);
     let run_test () = 
-      let p = f x data (vec_of_arr labels) |> predict_b in
+      let p = f x data labels |> predict_b in
       let wrong_a = ref 0 in
       Array.iter (fun x -> if p x <= 0. then incr wrong_a) testa;
       let wrong_b = ref 0 in
@@ -823,9 +819,9 @@ let train () =
 (* DONE  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k"; *)
 (* DONE  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k") *)
 (* DONE  Array.init train_rows (fun i -> i+1) |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" |> ignore; *)
- kperceptron_elems (gt_rbf 0.5) (ft_core ~b:200 ~b0:20) ~loops:100 
+ kperceptron_elems (gt_rbf 0.4) (ft_core ~b:200 ~b0:20) ~loops:100 
   |> extend_one_one (group_by_cat 750)
-  |> run_test "kprbf.7.1_ft10_40loops_1-1cap500" |> ignore
+  |> run_test "kprbf.4_ft200_100loops_1-1cap500" |> ignore
 
 (*  slice_shuffle train_rows 2048 |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" ~n:100_000 |> ignore *)
 
