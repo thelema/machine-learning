@@ -20,7 +20,7 @@ let get_matrix64 fn =
   let fh = openfile fn [O_RDONLY] 0o755 in
   Array2.map_file fh kind64 layout false cols (-1)
 
-let write_64 rows output_file =
+let write64 rows output_file =
   let fh = openfile output_file [O_RDWR;O_CREAT] 0o755 in
   Array2.map_file fh kind64 layout true cols rows
 
