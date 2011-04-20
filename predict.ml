@@ -1,11 +1,12 @@
 open Batteries_uni
 open Printf
 
-(*open Libosvm *)
+open Libosvm 
 open Lacaml.Impl.S (* Single-precision reals *)
 open Bigarray
 
 type matrix = (float, float32_elt, fortran_layout) Array2.t
+type mat64 = (float, float64_elt, fortran_layout) Array2.t
 type cats = (int, int8_unsigned_elt, fortran_layout) Array1.t
 type 'a pred_f_t = matrix -> (float * 'a) Enum.t
 
@@ -23,12 +24,26 @@ let train_data = Datafile.get_matrix "training.ba"
 let train_labels = Datafile.read_label_file "training_label.txt"
 let train_rows = Array1.dim train_labels
 
+let train_data64 = lazy(Datafile.get_matrix64 "training.txt.ba64")
+let d64_slice = Datafile.get_matrix64 "training.txt.ba64.slice"
+let d64_labels = Datafile.read_label_file "training_label.txt.slice"
+
 let pred_split p = abs_float p, (if p=0. then Random.bool () else p>0.)
 
 let norm ais = Vec.sqr_nrm2 ais |> sqrt
 let zeros ais = (1--Array1.dim ais) |> Enum.fold (fun acc i -> if ais.{i} = 0. then acc+1 else acc) 0
 let get_i (m:matrix) i = Array2.slice_right m i
 let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
+let vec64_of_arr a = Array1.of_array Datafile.kind64 Datafile.layout a
+let mat_of_arr a = Array2.of_array Datafile.kind64 Datafile.layout a
+
+let matrix_print oc (m:mat64) = 
+  for i = 1 to Array2.dim1 m do
+    for j = 1 to Array2.dim2 m do
+      fprintf oc "%.2f " m.{i,j};
+    done;
+    fprintf oc "\n";
+  done
 
 type bpredictor = 
   | Dot of float array (* weights of different features *)
@@ -37,11 +52,12 @@ type bpredictor =
   | Kern_pow of float * int array * float array (* exponent, offsets of data used, ais*)
   | Dot_plus of float array * float
   | Notest
+  | Svm_b of string (* filename of saved model *)
 
 type cpredictor = 
   | Hamm of bpredictor array * int array (* n predictors, n-bit codewords *)
   | One_one of (int * int) array * bpredictor array (* i vs j pairs, with a predictor for each *)
-  | Svm of string (* filename with serialized predictor *)
+  | Svm of string (* filename of saved model *)
   | Hedge of cpredictor array * float array
   | Pre_predicted of string (* filename with strength\tprediction lines *)
 
@@ -138,12 +154,11 @@ let shuffle a =
 
 
   (* Implementation of forgetron, a bounded memory perceptron *)
-let rec ft_core ~b ?(b0=10) (kij: matrix) (ais: vec) =
+let rec ft_core ~b ?(b0=10) ?(bincr=10) (kij: matrix) (ais: vec) =
   let n = Array1.dim ais in
   let forget_queue = ref Deque.empty in
   let q = ref 0. in (* sum of all cap_psi so far *)
   let m = ref 0 in (* total mistakes *)
-  let bincr = 10 in
   let bnow = ref (b0 - bincr) in
   printf "ft(%d)%!" n; 
   let process_order = Array.init n (fun i -> i+1) in
@@ -204,18 +219,18 @@ let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) 
     done;
     !acc +. 0.
   in
-  let process_order = Array.init n (fun i -> i+1) in
+  let process_order = Array.init n (fun i -> i) in
   fun (labels: float array) ->
     let m0 = !m in
     shuffle process_order;
     bnow := min b (!bnow + bincr);
     for i = 0 to n-1 do
-      let i = process_order.(i) in (* 0..n-1 -> 1..n *)
+      let i = process_order.(i) in (* 0..n-1 -> 0..n-1 *)
       (*      if i land 0xfff = 0 then printf ".%!"; *)
-      let yi = labels.(i-1) in
+      let yi = labels.(i) in
       let mu_i = f (get_i train_data offsets.(i)) in
       if yi *. mu_i <= 0. then ( (* guessed wrong or no guess *)
-	if ais.{i} = 0. then ( (* i is not in queue *)
+	if ais.{i+1} = 0. then ( (* i is not in queue *)
 	  (* put i in the queue *)
 	  forget_queue := Deque.cons i !forget_queue;
 	  if Deque.size !forget_queue > !bnow then (* overflow *)
@@ -224,10 +239,10 @@ let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) 
 	    forget_queue := fq;
 	    (* the weight for the oldest *)
 	    let sr = abs_float ais.{r} in 
-	    ais.{i} <- yi; (* add i to ais *)
+	    ais.{i+1} <- yi; (* add i to ais *)
 	    (* the current prediction for x_r *)
-	    let mu = labels.(r-1) *. f (get_i train_data r) in 
-	    ais.{r} <- 0.; (* remove r from ais *)
+	    let mu = labels.(r) *. f (get_i train_data r) in 
+	    ais.{r+1} <- 0.; (* remove r from ais *)
 	    let phi = solve_phi sr mu !q !m in  (* optimal phi *)
 	    if phi <= 0. then failwith "negative phi";
 	    if phi < 1. then (
@@ -237,48 +252,52 @@ let rec ft_core_onfly ~b ?(b0=10) (k: vec -> vec -> float) (offsets: int array) 
 	      q := !q +. cap_psi sr 1.0 mu; (* accumulate q *)
 	);
 	incr m;
-	ais.{i} <- yi (* no matter what, include i *)
+	ais.{i+1} <- yi (* no matter what, include i *)
       )
     done;
     (*    printf "(q:%.2f, m:%d)" !q !m; *)
     !m - m0 (* the number of mistakes this loop *)
-	
+
+(* RBF kernel function and Gram Matrix generator *)	
 let k_rbf two_s_sqr x1 x2 = exp (~-. (Vec.ssqr_diff x1 x2) /. two_s_sqr)
-let gen_kij_rbf two_sig_sq offsets =
+let gen_kij_rbf ?(debug=false) two_sig_sq offsets =
   let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
-(*  printf "Generating kij(%dx%d) using rbf(x,y)...%!" n n; *)
+  if debug then printf "rbf(%d^2)%!" n;
   for i = 1 to n do
+    if debug && i land 0xff = 0 then printf ".%!";
     let xi = (get_i train_data offsets.(i-1)) in
     for j = i to n do
       let k = k_rbf two_sig_sq xi (get_i train_data offsets.(j-1)) in
       kij.{i,j} <- k; kij.{j,i} <- k
     done;
   done;
-(*  printf "Done\n%!"; *)
+  if debug then printf "Done\n%!";
   kij
 
+(* x^3 kernel function and Gram Matrix generator *)
 let k_3 x1 x2 = let a = (1. +. dot x1 x2) in a *. a *. a
 let gen_kij_3 offsets =
   let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
-(*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
+  printf "k3(%d^2)%!" n;
   for i = 1 to n do
+    if i land 0xff = 0 then printf ".%!";
     let xi = (get_i train_data offsets.(i-1)) in
     for j = i to n do
       let k = k_3 xi (get_i train_data offsets.(j-1)) in
       kij.{i,j} <- k; kij.{j,i} <- k
     done;
   done;
-(*  printf "Done\n%!"; *)
   kij
 
 let k_pow pow x1 x2 = let a = (1. +. dot x1 x2) in a ** pow
-let gen_kij_pow pow offsets =
+let gen_kij_pow ?(debug=false) pow offsets =
   let n = Array.length offsets in
   let kij = Array2.create float32 fortran_layout n n in
-(*  printf "Generating kij(%dx%d) using (1 + x dot y)^3...%!" n n;*)
+  if debug then printf "x^%f(%d)%!" pow n;
   for i = 1 to n do
+    if i land 0xff = 0 then printf ".%!";
     let xi = (get_i train_data offsets.(i-1)) in
     for j = 1 to n do
       let k = k_3 xi (get_i train_data offsets.(j-1)) in
@@ -321,13 +340,6 @@ let clean (offs: int array) a =
   let a = Array1.to_array (a: vec) in
   clean2 (fun a -> a <> 0.) a offs
 
-let kernel_lsq kij labels =
-  let labels = vec_of_arr labels in
-  (* (kij + lambda I)^{-1} y *)
-  ()
-
-let simplify _ = assert false
-
 let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> float array -> int) ~loops offs labels_arr =
   let n = Array.length offs in
   let kij = genk offs in
@@ -340,8 +352,8 @@ let kperceptron_offs (genk,tag_v) (core: matrix -> vec -> float array -> int) ~l
     while !l < loops && !wrongs > cutoff do 
       incr l; wrongs := core labels 
     done;
-    if !l >= loops then (printf "F%d" !wrongs; Notest (*(kernel_lsq kij labels |> simplify |> tag_v)*)) 
-    else (printf "%d" !l; clean offs ais |> tag_v)
+    if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
+    clean offs ais |> tag_v
   in  
   Array.map run_perc labels_arr
 
@@ -361,8 +373,8 @@ let kperceptron_elems (genk, tag_v) core ~loops offs labels =
   while !l < loops && !wrongs > cutoff do 
     incr l; wrongs := core labels 
   done;
-  if !l >= loops then (printf "F%d" !wrongs; Notest) 
-  else (printf "%d" !l; clean offs ais |> tag_v)
+  if !l >= loops then printf "F%d" !wrongs else printf "%d" !l; 
+  clean offs ais |> tag_v
 
 let gt_k3 = (gen_kij_3, fun (a,o) -> Kern_3 (o,a))
 let gt_rbf sigma = (gen_kij_rbf sigma, fun (a,o) -> Kern_rbf(sigma,o,a))
@@ -385,6 +397,67 @@ let kperceptron_onfly (k, tag_v) core_fly ~loops offs labels =
   clean offs ais |> tag_v
 
   
+let print_statistics ?(oc=stdout) e =
+  match Enum.get e with
+      None -> fprintf oc "Empty enumeration - no statistics\n"
+    | Some x0 ->
+	let m = ref x0
+	and k = ref 1 
+	and s = ref 0. in
+	let t = ref 0. in
+	Enum.iter (fun x -> 
+		     t := !t +. x;
+		     incr k; 
+		     let mk = !m +. (x -. !m)/.(float !k) in 
+		     s := !s +. (x -. !m) *. (x -. mk);
+		     m := mk) e;
+	let stdev = sqrt(!s /. float (!k-1)) in
+	fprintf oc "N: %d Sum: %.2f Mean: %.2f Stdev: %.2f\n" !k !t !m stdev
+
+
+(* Kernel least squares  ~sigma is 2*sigma^2 *)
+let klsq ~lambda ~sigma ~cutoff d l = 
+  let k = gen_kij_rbf sigma d in
+  for i = 1 to Array.length d do
+    k.{i,i} <- k.{i,i} +. lambda
+  done;
+  let b = Mat.of_col_vecs [|vec_of_arr l|] in
+  getrs k b;
+  let a = Array2.slice_right b 1 |> Array1.to_array in
+  print_statistics (Array.enum a);
+  let a,o = clean2 (fun ai -> abs_float ai > cutoff) a d in
+  Kern_rbf (sigma, o, a)
+
+
+let svm (l: vec) = 
+  let fn = Filename.temp_file ~temp_dir:"svm/" "svmc" "" in 
+  let m = svm_train ~kernel_type:RBF d64_slice (Obj.magic l) in
+  svm_save_model ~file:fn ~m;
+  Svm fn
+
+let genmat n = 
+  Array2.create Datafile.kind64 Datafile.layout Datafile.cols n
+let dbuf = ref (genmat 1)
+
+let project_data_rows64 offs =
+  let n = Array.length offs in
+  if Array2.dim2 !dbuf <> n then dbuf := genmat n;
+  let dout = !dbuf in
+  let d = Lazy.force train_data64 in
+  let out_pos = ref 1 in
+  Array.iter (fun i -> Array1.blit (Array2.slice_right d i) (Array2.slice_right dout !out_pos); incr out_pos) offs;
+  dout
+  
+
+let svm offs labels = 
+  let d = project_data_rows64 offs in
+  let fn = Filename.temp_file ~temp_dir:"svm/" "svmb" "" in 
+  let m = svm_train ~kernel_type:RBF d (Obj.magic (vec64_of_arr labels)) in
+  svm_save_model ~file:fn ~m;
+  Svm_b fn
+
+    
+
 (*
 let () = printf "Reading..%!"
 let t0 = Sys.time()
@@ -459,7 +532,7 @@ let group_by_cat ?(category_count=category_count) cap =
   in
   Array.map cap_slice cats
 
-let extend_one_one cats_a gen_classifier =
+let extend_one_one cats_a rejector gen_classifier =
   printf "Training 1-1..\n%!";
   let cap = Array.fold_left (fun acc a -> let l = Array.length a in if l > acc then l else acc) 0 cats_a in
   let t0 = Sys.time() in
@@ -486,15 +559,16 @@ let extend_one_one cats_a gen_classifier =
       let cij = gen_classifier data labels in
       let t2 = Unix.gettimeofday () in
       printf "gen:%.2f\t" (t2-.t1);
-      ps := Vect.append cij !ps;
-      cat_pairs := Vect.append (i,j) !cat_pairs;
+      if not (rejector cij) then (
+	ps := Vect.append cij !ps;
+	cat_pairs := Vect.append (i,j) !cat_pairs;
+      )
     done
   done;
   let category_pairs = Vect.to_array !cat_pairs in
   let ps = Vect.to_array !ps in
   printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
-  let bpreds, pairs = clean2 ((<>) Notest) ps category_pairs in  
-  One_one (pairs, bpreds)
+  One_one (category_pairs, ps)
 
 (***************************************)
 (***********     SVM      **************)
@@ -514,34 +588,34 @@ let predict_b =
   | Dot warr -> let w = vec_of_arr warr in (fun x -> dot w x)
   | Dot_plus (warr, b) -> let w = vec_of_arr warr in (fun x -> dot w x +. b)
   | Kern_3 (offs, ais) ->
-    let len = Array.length offs in
 (*    printf "Kern3 decoder (off %d; len %d, %d ais)\n" off len (Array.length ais); *)
-    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
     (fun x -> 
+      let len = Array.length offs in
       let t = ref 0. in 
-      for i = 1 to len do 
-	t := !t +. ais.{i} *. k_3 x (get_i train_data offs.(i-1)); 
+      for i = 0 to len-1 do 
+	t := !t +. ais.(i) *. k_3 x (get_i train_data offs.(i)); 
       done; 
       !t +. 0.)
   | Kern_rbf (sigma, offs, ais) -> 
-    let len = Array.length offs in
-    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
     (fun x -> 
+      let len = Array.length offs in
       let t = ref 0. in 
-      for i = 1 to len do 
-	t := !t +. ais.{i} *. k_rbf sigma x (get_i train_data offs.(i-1)); 
+      for i = 0 to len-1 do 
+	t := !t +. ais.(i) *. k_rbf sigma x (get_i train_data offs.(i)); 
       done; 
       !t +. 0.)
   | Kern_pow (p, offs, ais) -> 
-    let len = Array.length offs in
-    let ais = Array1.of_array Datafile.kind Datafile.layout ais in
     (fun x -> 
+      let len = Array.length offs in
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.{i} *. k_pow p x (get_i train_data offs.(i-1)); 
+	t := !t +. ais.(i-1) *. k_pow p x (get_i train_data offs.(i-1)); 
       done; 
       !t +. 0.)
   | Notest -> (fun x -> 0.)
+  | Svm_b fn -> 
+    let m = svm_load_model fn in
+    (fun x -> svm_predict_probability m (mat_of_arr [|Array1.to_array x|]) |> Pair.print2 matrix_print stdout; 0.)
 
 let print_bpred oc = function
   | Dot w -> Array.length w |> fprintf oc "Dot(%d)"
@@ -550,6 +624,7 @@ let print_bpred oc = function
   | Kern_rbf (s,o,a) -> fprintf oc "RBF%.2f(%d)" s (Array.length o)
   | Kern_pow (p,o,a) -> fprintf oc "K%.1f(%d)" p (Array.length o)
   | Notest -> fprintf oc "NT"
+  | Svm_b fn -> fprintf oc "Svmb(%s)" fn
 
 let get_heads enum_l = 
   Array.fold_left (fun acc x -> match Enum.get x with 
@@ -592,9 +667,9 @@ let rec predict_cat = function
       float votes.(winner) /. float category_count, winner
     in
     (fun d -> Array.map (fun cl -> cl d) classifiers |> decode)
-  | Svm _file -> assert false
-(*    let m = svm_load_model ~file in
-    (fun xs -> svm_predict_32 ~m ~x:xs) *)
+  | Svm fn -> 
+    let m = svm_load_model fn in
+    (fun x -> svm_predict_probability m (mat_of_arr [|Array1.to_array x|]) |> Pair.print2 matrix_print stdout; (0., 1))
   | Hedge (es, ws) ->
     let classifiers = Array.map (fun p -> predict_cat p) es in
     let weight_sum = Array.reduce (+.) ws in
@@ -611,10 +686,59 @@ let rec predict_cat = function
     let i = ref 0 in
     (fun _ -> let r = ps.(!i) in incr i; r)
 
+let rec batch_predict_cat = function
+  | Hamm (bpreds, cat_map) ->
+    let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
+    let bits = Array.length bpreds in
+    let decode_bits = 
+      if bits < 20 then (* precompute decoding map when it's not too large *)
+	let decode_arr = Array.init (1 lsl bits) (fun i -> nearest_in cat_map i) in
+	(fun bits -> decode_arr.(bits))
+      else
+	(fun bits -> nearest_in cat_map bits)
+    in
+    (fun (m: matrix) -> 
+      let n = Array2.dim2 m in
+      let strs = Array.create n 1. in
+      let results = Array.create n 0 in 
+      for i = 0 to bits-1 do 
+	for j = 0 to n-1 do
+	  let pred = classifiers.(i) (get_i m (j+1)) in
+	  strs.(j) <- strs.(j) *. abs_float pred;
+	  results.(j) <- if pred >= 0. then results.(j) lsl 1 + 1 else results.(j) lsl 1;
+	done;
+      done;
+      Array.map2 (fun s r -> s, decode_bits r) strs results)
+  | One_one (pairs,bpreds) ->
+    let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
+    let decode votes = 
+      let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
+      float votes.(winner) /. float category_count, winner
+    in
+    (fun (m: matrix) -> 
+      let n = Array2.dim2 m in
+      let results = Array.create_matrix n (category_count+1) 0 in 
+      for i = 0 to Array.length pairs - 1 do 
+	for j = 1 to n do
+	  let pred = classifiers.(i) (get_i m j) in
+	  let (a,b) = pairs.(i) in
+	  if pred >= 0. 
+	  then results.(j).(a) <- results.(j).(a) + 1
+	  else results.(j).(b) <- results.(j).(b) + 1
+	done;
+      done;
+      Array.map decode results)
+  | Svm _file -> assert false
+(*    let m = svm_load_model ~file in
+    (fun xs -> svm_predict_32 ~m ~x:xs) *)
+  | Hedge (es, ws) -> assert false
+  | Pre_predicted fn -> assert false
+
+
 let rec print_cpred oc = function
   | Hamm (bps,cmap) -> fprintf oc "Hamm(%ax%d)" print_bpred bps.(0) (Array.length bps)
   | One_one (pairs, bpreds) -> fprintf oc "OVO(%ax%d)" print_bpred bpreds.(0) (Array.length bpreds)
-  | Svm fn -> fprintf oc "Svm(%s)" fn
+  | Svm _ -> fprintf oc "Svm()"
   | Hedge (es, ws) -> 
     fprintf oc "Hedge("; 
     for i = 0 to Array.length es - 1 do 
@@ -822,79 +946,3 @@ let pred_read fn =
   Pervasives.close_in ic;
   printf "Loaded predictor: %a\n%!" print_cpred p;
   p
-
-(***************************************)
-(**        MAIN        *****************)
-(***************************************)
-
-let train () = 
-(*  kperceptron3_slice 1 2000 |> extend_hamm |> marshal_file "hamm_kp3_0_2k"; *)
-(*  train_slices 1000 kperceptron3_slice |> List.iter (extend_hamm |- marshal_file "hamm_kp3_slc_1k"); *)
-(* DONE  kperceptron_slice (gt_rbf 50.) kp_core 100 1 2000 |> extend_hamm 32 |> tap (marshal_file "hamm_kpr_1_2k") |> run_test "hamm_kpr_1_2k"; *)
-(* DONE  train_slices 1000 (kperceptron_slice (gt_rbf 50.) kp_core 100) |> List.iter (extend_hamm 32 |- tap (marshal_file "hamm_kpr_slc_1k") |- run_test "hamm_kpr_slc_1k") *)
-(* DONE  Array.init train_rows (fun i -> i+1) |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" |> ignore; *)
-(*
- kperceptron_elems (gt_rbf 0.4) (ft_core ~b:200 ~b0:20) ~loops:100 
-  |> extend_one_one (group_by_cat 750)
-  |> run_test "kprbf.4_ft200_100loops_1-1cap500" |> ignore
-*)
-  kperceptron_offs (gt_rbf 0.4) (ft_core ~b:400) ~loops:500 (grouped_slice 20000)
-  |> extend_hamm 60
-  |> run_test "kprbf.4_ft400_50loops_hamm60" |> ignore
-
-(*  slice_shuffle train_rows 2048 |> batch_perb |> extend_hamm 32 |> run_test "hamm32_percb_full" ~n:100_000 |> ignore *)
-
-let predict_scan () = ()
-  (* scan for *.pred files, move them to *.pred_act, create a *.output file and write predictions there *)
-  (* rename to used.* when done *)
-
-let test () = 
-  (* best: 2K?
-     crossval_int (fun i ->   
-     let rand_offset = Random.int (Array2.dim2 train_data - i) in
-     kperceptron3_slice rand_offset i |> extend_hamm) [500; 1000; 2000; 4000; 8000; 10000; 15000; 20000]
-  *)
-
- 
-  (*kperceptron_elems gt_k3 kp_core 100 |> extend_one_one |> tap (marshal_file "oneone_kp3") |> run_test "kp3_5k_1-1"; *)
-
-(*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
-    ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 2000) |> extend_hamm 50);
-
-
-  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.; 100.]
-    ~f:(fun i -> kperceptron_slice (gt_rbf i) kp_core 100 (rand_slice 4000) |> extend_hamm 50);
-*)
-
-(*  extend_one_one (1,train_rows) perceptron_b ~cap:500 |> run_test "perb_full_1-1" |> ignore; *)
-
-
-
-(* SEARCH FOR PARAMETERS *)
-(* find the best sigma (0.3-1.0 is good) *)
-  cv_one_one (group_by_cat 1250) string_of_float ~loops:5
-    ~xs:[0.01; 0.1; 0.2; 0.3; 0.4; 0.5; 0.6; 0.7; 0.8; 0.9; 1.0; 1.2; 1.5; 2.0; 5.0] 
-    ~f:(fun s -> kperceptron_elems (gt_rbf s) (ft_core ~b:500) ~loops:250);
-
-(* find a good bound for forgetron memory (10 is enough)  *)
-(*
-  cv_one_one (group_by_cat 625) string_of_int ~loops:5
-    ~xs:[10; 15; 20; 25; 30; 35; 40; 50; 60; 80; 100; 150] 
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:max_int ~b0:n) ~loops:250); 
-*)
-(* Find a good number of perceptron iterations (40 passes costs no more time than one pass, it seems)
-  cv_one_one ~cap:500 string_of_int ~loops:5
-    ~xs:[1; 4; 10; 40; 100; 250; 500; 1000; 2500; 4000; 10000]
-    ~f:(fun n -> kperceptron_elems (gt_rbf 0.4) (ft_core ~b:50) ~loops:n);
- *)
-(*
-  kperceptron_elems (gt_rbf 0.1) (ft_core ~b:300) ~loops:100 |> extend_one_one ~cap:500 (1, train_rows) |> run_test "kprbf0.1_ft300_100loops_1-1cap500" |> ignore;
-*)
-
-(*  crossval ~n:3 ~xs:[0.01; 0.05; 0.1; 0.5; 1.; 2.; 4.; 7.; 9.; 10.]
-    ~f:(fun i -> kperceptron_slice (gt_rbf i) (ft_core ~b:1000) ~loops:1000 (rand_slice 4000) |> extend_hamm 50);*)
-
-
-  crossval_int ~n:3 ~xs:(8--31 |> List.of_enum)
-    ~f:(fun i -> kperceptron_offs (gt_rbf 0.3) (ft_core ~b:150 ~b0:10) ~loops:100 (grouped_slice 10000) |> extend_hamm i);
-    
