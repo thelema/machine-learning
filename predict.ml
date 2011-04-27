@@ -4,6 +4,7 @@ open Printf
 open Libosvm 
 open Lacaml.Impl.S (* Single-precision reals *)
 open Bigarray
+module Functory = Functory.Cores
 
 type matrix = (float, float32_elt, fortran_layout) Array2.t
 type mat64 = (float, float64_elt, fortran_layout) Array2.t
@@ -18,7 +19,8 @@ let category_count = 164
 let top_n = 100
 
 let set_mhs n = Gc.set { (Gc.get()) with Gc.minor_heap_size = n; } 
-let () = set_mhs 1_000_000; Random.self_init ();;
+let () = set_mhs 1_000_000; Random.self_init (); Functory.set_number_of_cores 4;;
+
 
 let train_data = Datafile.get_matrix "training.ba"
 let train_labels = Datafile.read_label_file "training_label.txt"
@@ -36,6 +38,8 @@ let get_i (m:matrix) i = Array2.slice_right m i
 let vec_of_arr a = Array1.of_array Datafile.kind Datafile.layout a
 let vec64_of_arr a = Array1.of_array Datafile.kind64 Datafile.layout a
 let mat_of_arr a = Array2.of_array Datafile.kind64 Datafile.layout a
+
+let get_i64m (m: matrix) i = mat_of_arr [|Array1.to_array (get_i m i)|]
 
 let matrix_print oc (m:mat64) = 
   for i = 1 to Array2.dim1 m do
@@ -534,40 +538,36 @@ let group_by_cat ?(category_count=category_count) cap =
 
 let extend_one_one cats_a rejector gen_classifier =
   printf "Training 1-1..\n%!";
-  let cap = Array.fold_left (fun acc a -> let l = Array.length a in if l > acc then l else acc) 0 cats_a in
-  let t0 = Sys.time() in
-  let cat_pairs = ref Vect.empty in
-  let ps = ref Vect.empty in
-  let common_buf = Array.create (cap * 2) 0 in
-  let common_label = Array.create (cap * 2) 0. in
+  let t0 = Unix.gettimeofday () in
+  let ijs = ref [] in
   for i = 1 to category_count do
     for j = i+1 to category_count do
-      let ilen = Array.length cats_a.(i) in
-      let jlen = Array.length cats_a.(j) in
-      let data, labels = 
-	if ilen + jlen = cap * 2 then ( (* use common buf *)
-	  Array.blit cats_a.(i) 0 common_buf 0 ilen;
-	  Array.blit cats_a.(j) 0 common_buf ilen jlen;
-	  Array.fill common_label 0 ilen (1.);
-	  Array.fill common_label ilen jlen (-1.);
-	  common_buf, common_label
-	) else (
-	  Array.append cats_a.(i) cats_a.(j), 
-	  Array.init (ilen + jlen) (fun i -> if i < ilen then 1. else -1.)
-	) in
-      let t1 = Unix.gettimeofday () in
-      let cij = gen_classifier data labels in
-      let t2 = Unix.gettimeofday () in
-      printf "gen:%.2f\t" (t2-.t1);
-      if not (rejector cij) then (
-	ps := Vect.append cij !ps;
-	cat_pairs := Vect.append (i,j) !cat_pairs;
-      )
+      ijs := (i,j) :: !ijs;
     done
   done;
-  let category_pairs = Vect.to_array !cat_pairs in
-  let ps = Vect.to_array !ps in
-  printf "Done training(%.2fs)\n%!" (Sys.time () -. t0);
+  let train_one (i,j) =
+    let t1 = Unix.gettimeofday () in
+    let ilen = Array.length cats_a.(i) in
+    let jlen = Array.length cats_a.(j) in
+    let data = Array.append cats_a.(i) cats_a.(j) in
+    let labels = 
+      Array.init (ilen + jlen) (fun i -> if i < ilen then 1. else -1.) 
+    in
+    let cij = gen_classifier data labels in
+    let t2 = Unix.gettimeofday () in
+    printf "gen:%.2f\t" (t2-.t1);
+    (cij, (i,j))
+  in
+  let add_item (ps, cat_pairs) (c, ij) =
+    (Vect.append c ps, Vect.append ij cat_pairs)
+  in
+  let ps, cat_pairs = 
+    Functory.map_local_fold  ~f:train_one ~fold:add_item 
+      (Vect.empty, Vect.empty) !ijs
+  in
+  let category_pairs = Vect.to_array cat_pairs in
+  let ps = Vect.to_array ps in
+  printf "Done training(%.2fs)\n%!" (Unix.gettimeofday () -. t0);
   One_one (category_pairs, ps)
 
 (***************************************)
@@ -582,6 +582,8 @@ let extend_one_one cats_a rejector gen_classifier =
 (***************************************)
 (** Prediction functions ***************)
 (***************************************)
+
+let is_svm = function Svm_b _ -> true | _ -> false
 
 let predict_b = 
   function
@@ -609,13 +611,19 @@ let predict_b =
       let len = Array.length offs in
       let t = ref 0. in 
       for i = 1 to len do 
-	t := !t +. ais.(i-1) *. k_pow p x (get_i train_data offs.(i-1)); 
+	t := !t +. ais.(i) *. k_pow p x (get_i train_data offs.(i)); 
       done; 
       !t +. 0.)
   | Notest -> (fun x -> 0.)
   | Svm_b fn -> 
     let m = svm_load_model fn in
     (fun x -> svm_predict_probability m (mat_of_arr [|Array1.to_array x|]) |> Pair.print2 matrix_print stdout; 0.)
+
+let predict_b64 = function
+  | Svm_b fn -> 
+    let m = svm_load_model fn in
+    (fun x -> svm_predict_probability m x |> Pair.print2 matrix_print stdout; 0.)
+  | _ -> failwith "Only SVM supported by predict_b64"
 
 let print_bpred oc = function
   | Dot w -> Array.length w |> fprintf oc "Dot(%d)"
@@ -642,9 +650,13 @@ let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
 let predict_many f d = 
   let t0 = Unix.gettimeofday () in 
-  let r = Array.init (Array2.dim2 d) (fun i -> if i land 0xfff = 0 then printf ".%!"; f (get_i d (i+1))) in
+  let l = List.init (Array2.dim2 d) (fun x -> x) in
+  let r = Functory.map (fun i -> f (get_i d (i+1))) l in
   printf "%.0f/s" (float (Array2.dim2 d) /. (Unix.gettimeofday () -. t0));
   r
+
+let e = exp 1.0
+let norm_small x = if x > (1. /. e) then x else (1. /. ( -.(log x))) /. e
 
 let rec predict_cat = function
   | Hamm (bpreds, cat_map) ->
@@ -653,9 +665,9 @@ let rec predict_cat = function
     let decode_bits = 
       if bits < 20 then (* precompute decoding map when it's not too large *)
 	let decode_arr = Array.init (1 lsl bits) (fun i -> nearest_in cat_map i) in
-	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in str, decode_arr.(bits))
+	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in norm_small str, decode_arr.(bits))
       else
-	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in str, nearest_in cat_map bits)
+	(fun l -> let (str, bits) = Array.fold_left merge_qb (1.,0) l in norm_small str, nearest_in cat_map bits)
     in
     (fun (d:vec) -> Array.map (fun cl -> cl d) classifiers |> decode_bits)
   | One_one (pairs,bpreds) ->
@@ -709,6 +721,22 @@ let rec batch_predict_cat = function
 	done;
       done;
       Array.map2 (fun s r -> s, decode_bits r) strs results)
+  | One_one (pairs,bpreds) when is_svm bpreds.(0) ->
+    let classifiers = Array.map (fun bp -> predict_b64 bp) bpreds in
+    let decode votes = 
+      let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
+      float votes.(winner) /. float category_count, winner
+    in
+    (fun m ->
+      let n = Array2.dim2 m in
+      let results = Array.create_matrix n (category_count+1) 0 in
+      let js = (1--n) |> List.of_enum in
+      for i = 0 to Array.length pairs - 1 do 
+	let c = classifiers.(i) in
+	let (a,b) = pairs.(i) in
+	Functory.map_local_fold ~f:(fun j -> c (get_i64m m j), j) ~fold:(fun () (pred,j) -> if pred >= 0. then results.(j).(a) <- results.(j).(a) + 1 else results.(j).(b) <- results.(j).(b) + 1) () js;
+      done;
+      Array.map decode results)
   | One_one (pairs,bpreds) ->
     let classifiers = Array.map (fun bp -> predict_b bp) bpreds in
     let decode votes = 
@@ -728,9 +756,7 @@ let rec batch_predict_cat = function
 	done;
       done;
       Array.map decode results)
-  | Svm _file -> assert false
-(*    let m = svm_load_model ~file in
-    (fun xs -> svm_predict_32 ~m ~x:xs) *)
+  | Svm _file -> assert false;
   | Hedge (es, ws) -> assert false
   | Pre_predicted fn -> assert false
 
@@ -832,7 +858,7 @@ let output_preds oc ps =
   Enum.print ~first:"" ~last:"" ~sep:"" print_pred oc (Map.enum ps)
 
 let print_pred_conf oc (conf, pred) =
-  fprintf oc "%d\t%f\n" pred conf
+  fprintf oc "%d\t%.12f\n" pred conf
 
 let print_cloned_head n ro ps = 
   let preds = Enum.clone ps |> Enum.take n |> Array.of_enum  in
@@ -870,7 +896,7 @@ let test_accuracy ?(n=10_000) name cpred =
   let right = 
     Array2.sub_right train_data off len 
   |> predict_many (predict_cat cpred)
-  |> Array.fold_lefti (fun acc i (_,l) -> if train_labels.{i+1} = l then acc+1 else acc) 0     
+  |> List.enum |> Enum.foldi (fun i (_,l) acc -> if train_labels.{i+1} = l then acc+1 else acc) 0     
   in
   let accuracy = 100. *. float right /. float n in
   printf "%s Accuracy: %d of %d (%.2f%%) (%.2fs)\n%!" name right n accuracy (Sys.time () -. t0);
@@ -880,7 +906,7 @@ let run_test ?(n = 10_000) name (cpred: cpredictor) =
   marshal_file name cpred;
   let t0 = Sys.time () in
   let off,len = rand_slice ~range:(Array2.dim2 train_data) n in
-  let eval = Array2.sub_right train_data off len |> predict_many (predict_cat cpred) |> Array.enum
+  let eval = Array2.sub_right train_data off len |> predict_many (predict_cat cpred) |> List.enum
 (*  |> tap (print_cloned_head 10 rand_offset) *)
   |> best_predictions 
   |> tap (fun ps -> File.with_file_out ("bests/" ^ name ^ ".bests") (fun oc -> output_preds oc ps))
@@ -938,7 +964,7 @@ let slice_shuffle n slice_len =
   1--slices |> Random.shuffle |> Array.enum |> Enum.map (fun i -> i --^ (i+slice_len)) |> Enum.flatten |> Array.of_enum
 
 let predict p oc =
-  predict_many (predict_cat p) train_data |> Array.iter (print_pred_conf oc)
+  predict_many (predict_cat p) train_data |> List.iter (print_pred_conf oc)
 
 let pred_read fn =
   let ic = Pervasives.open_in_bin fn in
