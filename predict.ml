@@ -19,7 +19,11 @@ let category_count = 164
 let top_n = 100
 
 let set_mhs n = Gc.set { (Gc.get()) with Gc.minor_heap_size = n; } 
-let () = set_mhs 1_000_000; Random.self_init (); Functory.set_number_of_cores 4;;
+let cores = 4
+let () = 
+  set_mhs 1_000_000; 
+  Random.self_init (); 
+  Functory.set_number_of_cores cores;;
 
 
 let train_data = Datafile.get_matrix "training.ba"
@@ -617,12 +621,12 @@ let predict_b =
   | Notest -> (fun x -> 0.)
   | Svm_b fn -> 
     let m = svm_load_model fn in
-    (fun x -> svm_predict_probability m (mat_of_arr [|Array1.to_array x|]) |> Pair.print2 matrix_print stdout; 0.)
+    (fun x -> svm_predict m (mat_of_arr [|Array1.to_array x|]) |> ignore; 0.)
 
 let predict_b64 = function
   | Svm_b fn -> 
     let m = svm_load_model fn in
-    (fun x -> svm_predict_probability m x |> Pair.print2 matrix_print stdout; 0.)
+    (fun x -> svm_predict m x)
   | _ -> failwith "Only SVM supported by predict_b64"
 
 let print_bpred oc = function
@@ -650,8 +654,8 @@ let rec to_bits n x = if n = 0 then [] else (if x land 1 = 1 then 1. else -1.) :
 let merge_qb (q,p) pred = (q *. abs_float pred, if pred >= 0. then p lsl 1 + 1 else p lsl 1)
 let predict_many f d = 
   let t0 = Unix.gettimeofday () in 
-  let l = List.init (Array2.dim2 d) (fun x -> x) in
-  let r = Functory.map (fun i -> f (get_i d (i+1))) l in
+  let l = (1--(Array2.dim2 d)) |> List.of_enum in
+  let r = Functory.map (fun i -> f (get_i d i)) l in
   printf "%.0f/s" (float (Array2.dim2 d) /. (Unix.gettimeofday () -. t0));
   r
 
@@ -722,7 +726,6 @@ let rec batch_predict_cat = function
       done;
       Array.map2 (fun s r -> s, decode_bits r) strs results)
   | One_one (pairs,bpreds) when is_svm bpreds.(0) ->
-    let classifiers = Array.map (fun bp -> predict_b64 bp) bpreds in
     let decode votes = 
       let winner = Enum.arg_max (fun i -> votes.(i)) (1--category_count) in
       float votes.(winner) /. float category_count, winner
@@ -730,11 +733,38 @@ let rec batch_predict_cat = function
     (fun m ->
       let n = Array2.dim2 m in
       let results = Array.create_matrix n (category_count+1) 0 in
-      let js = (1--n) |> List.of_enum in
+      let per_core = (n / cores) + 1 in
+      let gc_control = Gc.get() in
+      Gc.set {gc_control with Gc.space_overhead = 1};
+      let slices = (0--^cores) |> Enum.map (fun i -> per_core * i + 1) 
+      |> Enum.map (fun i0 -> printf "sl:%d %!" i0; Array.init (min per_core (n-i0)) 
+	  (fun i -> Array1.to_array (get_i m (i+i0))) 
+	  |> mat_of_arr) 
+      |> Array.of_enum
+      in
+      Gc.set gc_control;
+      let slice_ids = (0--^cores) |> List.of_enum in
+      let fold () (si, preds, a, b) =
+	let j0 = per_core * si + 1 in
+	for j = 1 to Array2.dim2 preds do 
+	  if preds.{1,j} >= 0. then 
+	    results.(j+j0).(a) <- results.(j+j0).(a) + 1 
+	  else 
+	    results.(j+j0).(b) <- results.(j+j0).(b) + 1
+	done;
+      in
+      let t0 = ref (Unix.gettimeofday()) in
       for i = 0 to Array.length pairs - 1 do 
-	let c = classifiers.(i) in
+	let c = predict_b64 bpreds.(i) in
 	let (a,b) = pairs.(i) in
-	Functory.map_local_fold ~f:(fun j -> c (get_i64m m j), j) ~fold:(fun () (pred,j) -> if pred >= 0. then results.(j).(a) <- results.(j).(a) + 1 else results.(j).(b) <- results.(j).(b) + 1) () js;
+	Functory.map_local_fold ~f:(fun si -> si, c slices.(si), a, b) ~fold () slice_ids;
+	printf ".%!";
+	if i land 0xf = 0xf then ( 
+	  let tnow = Unix.gettimeofday() in
+	  let tdiff = tnow -. !t0 in
+	  t0 := tnow;
+	  printf "%.3f/s\n" (float n *. tdiff /. 16.)
+	)
       done;
       Array.map decode results)
   | One_one (pairs,bpreds) ->
